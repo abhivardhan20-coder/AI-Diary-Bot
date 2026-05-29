@@ -695,21 +695,88 @@ async def reboot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎮 Commands\n"
-        "Command\tDescription\n"
-        "/start\tWelcome, name setup, and capability overview\n"
-        "/diary\tEnter diary mode for a structured entry\n"
-        "/diarylatest\tView your most recent diary analysis\n"
-        "/diarysearch <q>\tSearch through your diary entries\n"
-        "/mood\tView your emotional trends and report\n"
-        "/timeline\tSee your chronological life timeline\n"
-        "/summary\tGenerate a life summary (daily/weekly/monthly)\n"
-        "/memory\tView your memory statistics\n"
-        "/search <query>\tSearch your conversation history\n"
-        "/settime HH:MM\tSet your daily check-in reminder time\n"
-        "/export\tExport your data (JSON + Markdown)\n"
-        "/clear\tPermanently erase all your data"
+        "🤖 **Available Commands**\n\n"
+        "/start - start onboarding or greet Eva 🌙\n"
+        "/diary - write a new diary entry 📓\n"
+        "/entries - view your past diary entries\n"
+        "/chats - view your chat history and sessions 💬\n"
+        "/memory - view or delete things Eva remembers about you 🧠\n"
+        "/settime - configure daily reminder check-in time ⏰\n"
+        "/clear - clear all your data permanently ⚠️\n"
+        "/reboot - wipe everything and restart onboarding 🔄\n"
+        "/export - export your companion history and memories 📦\n"
+        "/commands - list all available commands 📋",
+        parse_mode="Markdown"
     )
+
+async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import os
+    from app.export_engine import parse_export_arguments, generate_export
+    
+    if not update.message or not update.effective_user:
+        return
+        
+    user_id = update.effective_user.id
+    db = get_db()
+    
+    async with get_session_manager().lock_user(user_id):
+        user_info = await db.get_user(user_id)
+        if not user_info or user_info.get("onboarding_status", "not_started") != "completed":
+            await update.message.reply_text("hey, let's finish introducing ourselves first! what's your name?")
+            return
+            
+        options = parse_export_arguments(context.args)
+        episode_count = await db.get_episode_count(user_id)
+        
+    # If the history is large (> 100 episodes), run the export in the background asynchronously
+    is_large = episode_count > 100
+    
+    if is_large:
+        await update.message.reply_text("⏳ I'm compiling your companion history archive in the background. I'll send it to you as soon as it's ready!")
+        
+        async def run_background_export():
+            try:
+                file_path, file_name = await generate_export(user_id, options)
+                if not file_path or not os.path.exists(file_path):
+                    await context.bot.send_message(chat_id=user_id, text="❌ Export failed. No matching data was found or generation failed.")
+                    return
+                    
+                with open(file_path, "rb") as doc:
+                    await context.bot.send_document(
+                        chat_id=user_id,
+                        document=doc,
+                        filename=file_name,
+                        caption="Here is your requested companion history archive! 📦✨"
+                    )
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+            except Exception as e:
+                logger.error("Async export failed for user %d: %s", user_id, e)
+                await context.bot.send_message(chat_id=user_id, text="❌ An error occurred during background export. Please try again.")
+                
+        asyncio.create_task(run_background_export())
+    else:
+        try:
+            file_path, file_name = await generate_export(user_id, options)
+            if not file_path or not os.path.exists(file_path):
+                await update.message.reply_text("❌ Export failed. No matching data was found or generation failed.")
+                return
+                
+            with open(file_path, "rb") as doc:
+                await update.message.reply_document(
+                    document=doc,
+                    filename=file_name,
+                    caption="Here is your requested companion history archive! 📦✨"
+                )
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        except Exception as e:
+            logger.error("Sync export failed for user %d: %s", user_id, e)
+            await update.message.reply_text("❌ An error occurred while generating your export. Please try again.")
 
 def rate_limited(handler, is_ai: bool = False):
     """Decorator to limit user requests and protect AI completion credits."""
@@ -753,6 +820,7 @@ def build_ptb_application() -> Application:
     app.add_handler(CommandHandler("clear", rate_limited(clear_handler)))
     app.add_handler(CommandHandler("reboot", rate_limited(reboot_handler)))
     app.add_handler(CommandHandler("commands", rate_limited(commands_handler)))
+    app.add_handler(CommandHandler("export", rate_limited(export_handler)))
     app.add_handler(CallbackQueryHandler(rate_limited(clear_callback_handler)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, rate_limited(message_handler, is_ai=True)))
     

@@ -718,6 +718,9 @@ class DatabaseManager:
             WHERE user_id = ? AND is_resolved = 0
         """, user_id)
 
+    async def get_all_memories(self, user_id: int) -> list[dict]:
+        return await self.fetch("SELECT * FROM memory_items WHERE user_id = ?", user_id)
+
     async def update_onboarding_data(self, user_id: int, **kwargs) -> None:
         allowed = {"onboarding_status", "age", "nationality", "city", "first_name"}
         fields = {k: v for k, v in kwargs.items() if k in allowed}
@@ -778,6 +781,10 @@ class DatabaseManager:
     async def get_session(self, user_id: int, session_id: str) -> dict | None:
         row = await self.fetchrow("SELECT * FROM sessions WHERE session_id = ? AND user_id = ?", session_id, user_id)
         return self._parse_session_row(row) if row else None
+
+    async def get_all_sessions(self, user_id: int) -> list[dict]:
+        rows = await self.fetch("SELECT * FROM sessions WHERE user_id = ? ORDER BY start_time ASC", user_id)
+        return [self._parse_session_row(r) for r in rows]
 
     def _parse_session_row(self, row) -> dict:
         d = dict(row)
