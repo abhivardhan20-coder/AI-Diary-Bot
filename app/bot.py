@@ -695,17 +695,20 @@ async def reboot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **Available Commands**\n\n"
-        "/start - start onboarding or greet Eva 🌙\n"
-        "/diary - write a new diary entry 📓\n"
-        "/entries - view your past diary entries\n"
-        "/chats - view your chat history and sessions 💬\n"
-        "/memory - view or delete things Eva remembers about you 🧠\n"
-        "/settime - configure daily reminder check-in time ⏰\n"
-        "/clear - clear all your data permanently ⚠️\n"
-        "/reboot - wipe everything and restart onboarding 🔄\n"
-        "/commands - list all available commands 📋",
-        parse_mode="Markdown"
+        "🎮 Commands\n"
+        "Command\tDescription\n"
+        "/start\tWelcome, name setup, and capability overview\n"
+        "/diary\tEnter diary mode for a structured entry\n"
+        "/diarylatest\tView your most recent diary analysis\n"
+        "/diarysearch <q>\tSearch through your diary entries\n"
+        "/mood\tView your emotional trends and report\n"
+        "/timeline\tSee your chronological life timeline\n"
+        "/summary\tGenerate a life summary (daily/weekly/monthly)\n"
+        "/memory\tView your memory statistics\n"
+        "/search <query>\tSearch your conversation history\n"
+        "/settime HH:MM\tSet your daily check-in reminder time\n"
+        "/export\tExport your data (JSON + Markdown)\n"
+        "/clear\tPermanently erase all your data"
     )
 
 def rate_limited(handler, is_ai: bool = False):

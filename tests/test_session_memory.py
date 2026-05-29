@@ -239,6 +239,6 @@ async def test_commands_handler():
     content = args[0]
     assert "/start" in content
     assert "/diary" in content
-    assert "/commands" in content
-    assert "Available Commands" in content
+    assert "/diarylatest" in content
+    assert "🎮 Commands" in content
 
