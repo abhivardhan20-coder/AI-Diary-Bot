@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/webhook",
+      "dest": "api/index.py"
+    },
+    {
+      "src": "/cron/(.*)",
+      "dest": "api/index.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "api/index.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/cron/daily",
+      "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/cron/reminder",
+      "schedule": "*/15 * * * *"
+    }
+  ]
+}

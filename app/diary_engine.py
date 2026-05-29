@@ -16,12 +16,12 @@ async def process_diary_entry(user_id: int, raw_text: str) -> dict:
     
     # Analysis
     profile = await get_profile(user_id)
-    p_str = profile_to_context_string(profile)
+    p_str = await profile_to_context_string(profile, user_id)
     prompt = DIARY_ANALYSIS_PROMPT.format(diary_text=raw_text, profile=p_str or "(new user)")
     analysis = await get_llm().analyze_emotion(prompt)
     
     if analysis:
-        await db.update_diary_entry(entry_id, **analysis)
+        await db.update_diary_entry(user_id, entry_id, **analysis)
     else:
         analysis = {}
 
@@ -36,7 +36,7 @@ async def process_diary_entry(user_id: int, raw_text: str) -> dict:
     followup = await get_llm().chat("You are a warm AI diary companion.", follow_prompt, max_tokens=300)
     
     if followup:
-        await db.update_diary_entry(entry_id, ai_followup=followup)
+        await db.update_diary_entry(user_id, entry_id, ai_followup=followup)
         await update_profile_from_conversation(user_id, raw_text, followup)
 
     return {"entry_id": entry_id, "analysis": analysis, "followup": followup}

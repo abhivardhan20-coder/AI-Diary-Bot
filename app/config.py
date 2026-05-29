@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+IS_VERCEL: bool = os.getenv("VERCEL") is not None
+
 # ── Secrets & Core Env ──────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
@@ -17,7 +19,12 @@ OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 # Webhook Settings
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")  # e.g., https://your-app.up.railway.app
 WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "super-secret-token")
+CRON_SECRET: str = os.getenv("CRON_SECRET", "")
 PORT: int = int(os.getenv("PORT", "8000"))
+
+# Cloud Storage Settings
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+REDIS_URL: str = os.getenv("REDIS_URL", "")
 
 # ── LLM Settings ────────────────────────────────────────────────────────────────
 LLM_BASE_URL: str = "https://openrouter.ai/api/v1"
@@ -28,16 +35,16 @@ LLM_RETRY_ATTEMPTS: int = 3
 LLM_RETRY_BASE_DELAY: float = 1.0
 
 # ── Paths ────────────────────────────────────────────────────────────────────────
-# In Docker, we'll mount a volume at /app/data
 BASE_DIR: Path = Path(__file__).parent.parent
-DATA_DIR: Path = Path(os.getenv("DATA_PATH", str(BASE_DIR / "data")))
-BACKUP_DIR: Path = Path(os.getenv("BACKUP_PATH", str(BASE_DIR / "backups")))
-EXPORT_DIR: Path = Path(os.getenv("EXPORT_PATH", str(BASE_DIR / "exports")))
-LOG_DIR: Path = Path(os.getenv("LOG_PATH", str(BASE_DIR / "logs")))
+DATA_DIR: Path = Path(os.getenv("DATA_PATH", str(BASE_DIR / "data") if not IS_VERCEL else "/tmp"))
+BACKUP_DIR: Path = Path(os.getenv("BACKUP_PATH", str(BASE_DIR / "backups") if not IS_VERCEL else "/tmp"))
+EXPORT_DIR: Path = Path(os.getenv("EXPORT_PATH", str(BASE_DIR / "exports") if not IS_VERCEL else "/tmp"))
+LOG_DIR: Path = Path(os.getenv("LOG_PATH", str(BASE_DIR / "logs") if not IS_VERCEL else "/tmp"))
 
-# Create directories
-for d in (DATA_DIR, BACKUP_DIR, EXPORT_DIR, LOG_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+# Create directories only outside of Vercel serverless environment
+if not IS_VERCEL:
+    for d in (DATA_DIR, BACKUP_DIR, EXPORT_DIR, LOG_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
 DB_PATH: Path = DATA_DIR / "diary.db"
 
