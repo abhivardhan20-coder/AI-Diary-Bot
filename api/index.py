@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import hmac
+import httpx
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 from telegram import Update
@@ -11,6 +13,11 @@ from app.bot import get_ptb_app
 from app.database import get_db
 from app.utils import check_and_generate_summaries
 from app.semantic_engine import curate_user_profile
+
+def safe_compare(val1: str, val2: str) -> bool:
+    if not val1 or not val2:
+        return False
+    return hmac.compare_digest(val1.encode("utf-8"), val2.encode("utf-8"))
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -46,6 +53,30 @@ async def lifespan(app: FastAPI):
         # Start PTB application
         await ptb_app.start()
         logger.info("PTB application started successfully.")
+        
+        # Register bot commands menu on startup
+        from telegram import BotCommand
+        commands_list = [
+            BotCommand("start", "start onboarding or greet Eva"),
+            BotCommand("diary", "write a new diary entry"),
+            BotCommand("entries", "view your past diary entries"),
+            BotCommand("chats", "view your chat history and sessions"),
+            BotCommand("memory", "view or delete things Eva remembers about you"),
+            BotCommand("settime", "configure daily reminder check-in time"),
+            BotCommand("clear", "clear all your data permanently"),
+            BotCommand("reboot", "wipe everything and restart onboarding"),
+            BotCommand("export", "export your companion history and memories"),
+            BotCommand("search", "search past conversations by keyword"),
+            BotCommand("stats", "view your usage statistics and streaks"),
+            BotCommand("mood", "show emotional trend breakdown"),
+            BotCommand("help", "list all available commands"),
+            BotCommand("commands", "list all available commands")
+        ]
+        try:
+            await ptb_app.bot.set_my_commands(commands_list)
+            logger.info("Bot commands menu registered successfully.")
+        except Exception as e:
+            logger.error("Failed to set bot commands: %s", e)
         
         if not IS_VERCEL:
             # Long-running server (Railway / Local): setup webhook or polling
@@ -107,7 +138,7 @@ async def health():
 async def setup_webhook(request: Request):
     # SEC-2 [CRITICAL]: setup-webhook Endpoint Has No Authentication
     token = request.headers.get("X-Admin-Token") or request.query_params.get("token", "")
-    if not CRON_SECRET or token != CRON_SECRET:
+    if not CRON_SECRET or not safe_compare(token, CRON_SECRET):
         logger.warning("Unauthorized /setup-webhook attempt")
         return Response(status_code=status.HTTP_403_FORBIDDEN)
 
@@ -144,16 +175,16 @@ async def setup_webhook(request: Request):
         logger.error("Failed to set webhook: %s", e, exc_info=True)
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Failed to set webhook. Please check server logs.",
             "webhook_url": webhook_path
         }
 
 @app.post("/webhook")
 async def webhook(request: Request):
     client_host = request.client.host if request.client else "unknown"
-    # Verify secret token
-    token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if token != WEBHOOK_SECRET:
+    # Verify secret token in timing-safe way
+    token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not WEBHOOK_SECRET or not safe_compare(token, WEBHOOK_SECRET):
         logger.warning("Unauthorized webhook attempt from IP %s with invalid secret", client_host)
         return Response(status_code=status.HTTP_403_FORBIDDEN)
 
@@ -192,11 +223,13 @@ async def webhook(request: Request):
 async def cron_daily(request: Request):
     client_host = request.client.host if request.client else "unknown"
     if CRON_SECRET:
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or auth_header != f"Bearer {CRON_SECRET}":
+        auth_header = request.headers.get("Authorization", "")
+        expected_header = f"Bearer {CRON_SECRET}"
+        if not safe_compare(auth_header, expected_header):
             logger.warning("Unauthorized cron attempt from IP %s with invalid secret", client_host)
             return Response(status_code=status.HTTP_401_UNAUTHORIZED)
-    logger.info("Executing Vercel Cron: Daily Summaries, Session Compaction & Curation")
+            
+    logger.info("Executing daily summaries and curation cron")
     db = get_db()
     try:
         # Run out-of-band session compaction globally for all uncompacted ended sessions
@@ -204,17 +237,64 @@ async def cron_daily(request: Request):
         await compact_uncompacted_sessions()
         
         users = await db.get_all_users()
-        for u in users:
-            uid = u["user_id"]
-            try:
-                await check_and_generate_summaries(uid)
-                await curate_user_profile(uid)
-            except Exception as e:
-                logger.error("Cron failed for user %d: %s", uid, e)
+        user_ids = [u["user_id"] for u in users]
+        
+        from app.config import QSTASH_TOKEN, WEBHOOK_URL
+        if QSTASH_TOKEN and WEBHOOK_URL:
+            logger.info("Enqueuing daily cron jobs to QStash for %d users", len(user_ids))
+            async with httpx.AsyncClient() as client:
+                for uid in user_ids:
+                    try:
+                        # Enqueue a call to /cron/user-daily
+                        res = await client.post(
+                            f"https://qstash.upstash.io/v2/publish/{WEBHOOK_URL.rstrip('/')}/cron/user-daily",
+                            headers={
+                                "Authorization": f"Bearer {QSTASH_TOKEN}",
+                                "Upstash-Forward-Authorization": f"Bearer {CRON_SECRET}",
+                                "Content-Type": "application/json"
+                            },
+                            json={"user_id": uid}
+                        )
+                        res.raise_for_status()
+                    except Exception as eq:
+                        logger.error("Failed to enqueue daily cron for user %d: %s", uid, eq)
+        else:
+            logger.warning("QStash not configured. Falling back to sequential execution for %d users", len(user_ids))
+            for uid in user_ids:
+                try:
+                    await check_and_generate_summaries(uid)
+                    await curate_user_profile(uid)
+                except Exception as ue:
+                    logger.error("Sequential cron failed for user %d: %s", uid, ue)
+                    
     except Exception as e:
         logger.error("Daily summaries cron failed: %s", e)
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed", "error": "Cron failed. Check logs for details."}
     return {"status": "success"}
+
+@app.post("/cron/user-daily")
+async def cron_user_daily(request: Request):
+    client_host = request.client.host if request.client else "unknown"
+    if CRON_SECRET:
+        auth_header = request.headers.get("Authorization", "")
+        expected_header = f"Bearer {CRON_SECRET}"
+        if not safe_compare(auth_header, expected_header):
+            logger.warning("Unauthorized user cron attempt from IP %s", client_host)
+            return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+            
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        if not user_id:
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"detail": "Missing user_id"})
+            
+        logger.info("Executing daily summaries and curation for user %d", user_id)
+        await check_and_generate_summaries(user_id)
+        await curate_user_profile(user_id)
+        return {"status": "success", "user_id": user_id}
+    except Exception as e:
+        logger.error("Daily summaries cron failed for user %s: %s", user_id, e)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @app.post("/qstash-reminder")
 async def qstash_reminder(request: Request):

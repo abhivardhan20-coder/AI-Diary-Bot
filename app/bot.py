@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
-from app.config import TELEGRAM_BOT_TOKEN, DEFAULT_TIMEZONE, DEFAULT_REMINDER_TIME
+from app.config import TELEGRAM_BOT_TOKEN, DEFAULT_TIMEZONE, DEFAULT_REMINDER_TIME, IS_VERCEL
 from app.database import get_db
 from app.memory_engine import get_memory_summary, save_episode, analyze_emotion, compact_session
 from app.retrieval_engine import build_context
@@ -205,20 +205,16 @@ async def handle_onboarding_message(update: Update, context: ContextTypes.DEFAUL
             "by the way, if you ever want to write down your thoughts, just use /diary. you can also view what i remember about you with /memory, check your entries with /entries, and look at previous chats with /chats."
         )
 
-def sanitize_for_prompt(text: str, max_len: int = 2000) -> str:
-    """Sanitize user messages to prevent prompt injection."""
-    text = text[:max_len]
-    injection_patterns = [
-        r'ignore (all |previous |above |prior )',
-        r'new (instruction|directive|rule|system|prompt)',
-        r'you are now',
-        r'forget everything',
-    ]
-    for pat in injection_patterns:
-        if re.search(pat, text, re.IGNORECASE):
-            logger.warning("Possible prompt injection detected and filtered")
-            text = re.sub(pat, '[FILTERED]', text, flags=re.IGNORECASE)
-    return text
+def sanitize_for_prompt(text: str, max_len: int = 4000) -> str:
+    """Sanitize user messages by capping length to limit injection payload size."""
+    return text[:max_len]
+
+def escape_markdown(text: str) -> str:
+    """Escapes Markdown V1 reserved characters (_ * ` [) to prevent Telegram parser errors."""
+    if not text:
+        return ""
+    escape_chars = r'_*`['
+    return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', text)
 
 def _classify_message_type(text: str) -> tuple[str, int, str]:
     """Classify the message and determine token limits/directives."""
@@ -309,10 +305,16 @@ async def _manage_session(user_id: int, user_info: dict, now_dt: datetime, last_
         if current_session_id:
             end_time_str = last_seen_str or now_str
             writes.append(db.update_session(user_id, current_session_id, end_time=end_time_str))
-            # Trigger out-of-band compaction in background task
-            asyncio.create_task(compact_session(user_id, current_session_id))
             
         await asyncio.gather(*writes)
+        
+        if current_session_id:
+            # Trigger out-of-band compaction
+            if IS_VERCEL:
+                await compact_session(user_id, current_session_id)
+            else:
+                asyncio.create_task(compact_session(user_id, current_session_id))
+                
         return new_session_id
         
     return current_session_id
@@ -433,7 +435,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response)
             
             # Trigger background enrichment
-            asyncio.create_task(_run_enrichment(user_id, text, response, episode_id, classification, current_session_id))
+            if IS_VERCEL:
+                await _run_enrichment(user_id, text, response, episode_id, classification, current_session_id)
+            else:
+                asyncio.create_task(_run_enrichment(user_id, text, response, episode_id, classification, current_session_id))
         except Exception as e:
             logger.error("Chat failed: %s", e)
             await update.message.reply_text("I'm a bit overwhelmed right now. Try again soon? 🤔")
@@ -492,9 +497,10 @@ async def entries_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"📅 **{d}**")
         for entry in grouped[d]:
             time_str = entry["created_at"][11:16]
-            title = entry.get("title") or "Untitled Entry"
-            emotions = entry.get("detected_emotions") or "neutral"
-            snippet = entry["raw_text"][:120] + "..." if len(entry["raw_text"]) > 120 else entry["raw_text"]
+            title = escape_markdown(entry.get("title") or "Untitled Entry")
+            emotions = escape_markdown(entry.get("detected_emotions") or "neutral")
+            raw_snippet = entry["raw_text"][:120] + "..." if len(entry["raw_text"]) > 120 else entry["raw_text"]
+            snippet = escape_markdown(raw_snippet)
             lines.append(f"- *{time_str}* - **{title}** (Mood: {emotions})\n  \"{snippet}\"")
         lines.append("")
 
@@ -525,8 +531,8 @@ async def chats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = [f"💬 **Conversation on {date_str}**\n"]
             for ep in episodes:
                 time_str = ep["timestamp"][11:16]
-                lines.append(f"[{time_str}] **You**: {ep['user_message']}")
-                lines.append(f"[{time_str}] **Eva**: {ep['bot_response']}\n")
+                lines.append(f"[{time_str}] **You**: {escape_markdown(ep['user_message'])}")
+                lines.append(f"[{time_str}] **Eva**: {escape_markdown(ep['bot_response'])}\n")
 
             full_text = "\n".join(lines)
             if len(full_text) > 4000:
@@ -564,13 +570,27 @@ async def chats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     end_idx = start_idx + limit
     dates_to_show = dates[start_idx:end_idx]
 
+    summary_map = {}
+    if dates_to_show:
+        conditions = []
+        params = [user_id, 'daily']
+        for d in dates_to_show:
+            conditions.append("period_start LIKE ?")
+            params.append(f"{d}%")
+        query = f"""
+            SELECT period_start, content FROM summaries
+            WHERE user_id = ? AND summary_type = ? AND ({ " OR ".join(conditions) })
+        """
+        rows = await db.fetch(query, *params)
+        for r in rows:
+            p_start = r["period_start"]
+            if p_start and len(p_start) >= 10:
+                summary_map[p_start[:10]] = r["content"]
+
     lines = [f"💬 **Your Chat History** (Page {page} of {total_pages})\n"]
     for d in dates_to_show:
-        row = await db.fetchrow("""
-            SELECT content FROM summaries 
-            WHERE user_id = ? AND summary_type = 'daily' AND period_start LIKE ?
-        """, user_id, f"{d}%")
-        summary_text = row["content"] if row else "Ongoing conversation..."
+        summary_val = summary_map.get(d, "Ongoing conversation...")
+        summary_text = escape_markdown(summary_val)
 
         lines.append(f"📅 **{d}**")
         lines.append(f"*Summary*: {summary_text}")
@@ -757,27 +777,6 @@ async def reboot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from telegram import BotCommand
-    commands_list = [
-        BotCommand("start", "start onboarding or greet Eva"),
-        BotCommand("diary", "write a new diary entry"),
-        BotCommand("entries", "view your past diary entries"),
-        BotCommand("chats", "view your chat history and sessions"),
-        BotCommand("memory", "view or delete things Eva remembers about you"),
-        BotCommand("settime", "configure daily reminder check-in time"),
-        BotCommand("clear", "clear all your data permanently"),
-        BotCommand("reboot", "wipe everything and restart onboarding"),
-        BotCommand("export", "export your companion history and memories"),
-        BotCommand("search", "search past conversations by keyword"),
-        BotCommand("stats", "view your usage statistics and streaks"),
-        BotCommand("mood", "show emotional trend breakdown"),
-        BotCommand("help", "list all available commands"),
-        BotCommand("commands", "list all available commands")
-    ]
-    try:
-        await context.bot.set_my_commands(commands_list)
-    except Exception as e:
-        logger.error("Failed to set commands menu: %s", e)
 
     await update.message.reply_text(
         "🤖 **Available Commands**\n\n"
@@ -824,8 +823,8 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = ep["timestamp"][:10]
         time_str = ep["timestamp"][11:16]
         lines.append(f"📅 **{date_str} {time_str}**")
-        lines.append(f"👤 **You**: {ep['user_message']}")
-        lines.append(f"🤖 **Eva**: {ep['bot_response']}\n")
+        lines.append(f"👤 **You**: {escape_markdown(ep['user_message'])}")
+        lines.append(f"🤖 **Eva**: {escape_markdown(ep['bot_response'])}\n")
         
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -944,7 +943,10 @@ async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error("Async export failed for user %d: %s", user_id, e)
                 await context.bot.send_message(chat_id=user_id, text="❌ An error occurred during background export. Please try again.")
                 
-        asyncio.create_task(run_background_export())
+        if IS_VERCEL:
+            await run_background_export()
+        else:
+            asyncio.create_task(run_background_export())
     else:
         try:
             file_path, file_name = await generate_export(user_id, options)
