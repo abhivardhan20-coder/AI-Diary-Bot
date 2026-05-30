@@ -12,6 +12,7 @@ from app.utils import check_and_generate_summaries
 from app.semantic_engine import curate_user_profile
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 # Expose app for Vercel
 app = FastAPI()
@@ -31,8 +32,19 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.on_event("startup")
 async def startup():
-    await get_db().initialize()
-    await ptb_app.initialize()
+    try:
+        logger.info("Starting database initialization...")
+        await get_db().initialize()
+        logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error("DATABASE INIT FAILED: %s", e, exc_info=True)
+        # Don't re-raise — let the app start so we can at least see health/root endpoints
+    try:
+        logger.info("Starting PTB application initialization...")
+        await ptb_app.initialize()
+        logger.info("PTB application initialized successfully.")
+    except Exception as e:
+        logger.error("PTB INIT FAILED: %s", e, exc_info=True)
 
 @app.on_event("shutdown")
 async def shutdown():
