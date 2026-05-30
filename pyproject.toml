@@ -13,4 +13,9 @@ dependencies = [
     "aiofiles>=24.1.0",
     "asyncpg>=0.31.0",
     "qstash>=3.4.0",
+    "fastapi>=0.136.3",
+    "uvicorn>=0.48.0",
+    "httpx>=0.28.1",
+    "python-multipart>=0.0.29",
+    "redis>=8.0.0",
 ]
