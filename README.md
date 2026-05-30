@@ -15,10 +15,8 @@ A deeply personalized, persistent AI diary and long-term advisor on Telegram. Un
 - **Structured Entries**: Use `/diary` to write deep reflections that are analyzed for meaning and importance.
 - **Importance Scoring**: AI identifies major life milestones and breakthroughs.
 - **AI Follow-ups**: Receive warm, empathetic, and reflective questions after every entry.
-- **Life Timeline**: View a chronological history of your most important moments with `/timeline`.
 
 ### 📊 Insights & Reflection
-- **Mood Tracking**: View your emotional trajectory and triggers with `/mood`.
 - **Context-Aware Advisor**: The bot uses all historical context to give deeply personalized advice.
 - **Daily Check-ins**: Scheduled reminders to encourage consistent journaling.
 
@@ -70,30 +68,29 @@ uv run python bot.py
 
 | Command | Description |
 |---|---|
-| `/start` | Welcome, name setup, and capability overview |
-| `/diary` | Enter diary mode for a structured entry |
-| `/diarylatest` | View your most recent diary analysis |
-| `/diarysearch <q>` | Search through your diary entries |
-| `/mood` | View your emotional trends and report |
-| `/timeline` | See your chronological life timeline |
-| `/summary` | Generate a life summary (daily/weekly/monthly) |
-| `/memory` | View your memory statistics |
-| `/search <query>` | Search your conversation history |
-| `/settime HH:MM` | Set your daily check-in reminder time |
-| `/export` | Export your data (JSON + Markdown) |
-| `/clear` | Permanently erase all your data |
+| `/start` | Start onboarding or greet Eva 🌙 |
+| `/diary` | Write a new diary entry 📓 |
+| `/entries` | View your past diary entries |
+| `/chats` | View your chat history and sessions 💬 |
+| `/memory` | View or delete things Eva remembers about you 🧠 |
+| `/settime` | Configure daily reminder check-in time ⏰ |
+| `/clear` | Clear all your data permanently ⚠️ |
+| `/reboot` | Wipe everything and restart onboarding 🔄 |
+| `/export` | Export your companion history and memories 📦 |
+| `/commands` | List all available commands 📋 |
 
 ## 📂 Project Structure
 
-- `bot.py`: Main Telegram handlers and message routing.
-- `database.py`: Core SQLite logic and schema management.
-- `diary_engine.py`: Deep analysis pipeline for diary entries.
-- `retrieval_engine.py`: 7-layer hybrid memory retrieval.
-- `semantic_profile.py`: User profile extraction and storage.
-- `emotion_engine.py`: Pattern detection and emotion analysis.
-- `scheduler.py`: Daily reminders and periodic backups.
-- `summarizer.py`: Rolling life summary generation.
-- `llm_client.py`: Resilient async LLM interface.
+- `app/bot.py`: Main Telegram handlers and message routing.
+- `app/database.py`: Core SQLite logic and schema management.
+- `app/diary_engine.py`: Deep analysis pipeline for diary entries.
+- `app/export_engine.py`: Data export functionality.
+- `app/memory_engine.py`: Emotion analysis and session memory operations.
+- `app/retrieval_engine.py`: Hybrid memory retrieval.
+- `app/scheduler.py`: Daily reminders and periodic backups.
+- `app/semantic_engine.py`: User profile extraction and storage.
+- `app/webhook.py`: FastAPI webhook server for Telegram Bot.
+- `app/utils.py`: Resilient async LLM interface and utilities.
 
 ## ⚙️ Customization
 Edit `config.py` to adjust:

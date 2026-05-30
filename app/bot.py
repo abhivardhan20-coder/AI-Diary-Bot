@@ -694,6 +694,24 @@ async def reboot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram import BotCommand
+    commands_list = [
+        BotCommand("start", "start onboarding or greet Eva"),
+        BotCommand("diary", "write a new diary entry"),
+        BotCommand("entries", "view your past diary entries"),
+        BotCommand("chats", "view your chat history and sessions"),
+        BotCommand("memory", "view or delete things Eva remembers about you"),
+        BotCommand("settime", "configure daily reminder check-in time"),
+        BotCommand("clear", "clear all your data permanently"),
+        BotCommand("reboot", "wipe everything and restart onboarding"),
+        BotCommand("export", "export your companion history and memories"),
+        BotCommand("commands", "list all available commands")
+    ]
+    try:
+        await context.bot.set_my_commands(commands_list)
+    except Exception as e:
+        logger.error("Failed to set commands menu: %s", e)
+
     await update.message.reply_text(
         "🤖 **Available Commands**\n\n"
         "/start - start onboarding or greet Eva 🌙\n"
