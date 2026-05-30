@@ -451,9 +451,19 @@ class DatabaseManager:
                     first_name = COALESCE(excluded.first_name, users.first_name),
                     updated_at = excluded.updated_at
             """, user_id, username, first_name, now, now)
+        from app.utils import get_cache
+        await get_cache().delete(f"user:info:{user_id}")
 
     async def get_user(self, user_id: int) -> dict | None:
-        return await self.fetchrow("SELECT * FROM users WHERE user_id = ?", user_id)
+        from app.utils import get_cache
+        cache_key = f"user:info:{user_id}"
+        cached = await get_cache().get(cache_key)
+        if cached is not None:
+            return cached
+        res = await self.fetchrow("SELECT * FROM users WHERE user_id = ?", user_id)
+        if res:
+            await get_cache().set(cache_key, res, ttl=86400)
+        return res
 
     async def update_user_settings(self, user_id: int, **kwargs) -> None:
         allowed = {"timezone", "reminder_time", "reminder_enabled"}
@@ -469,6 +479,8 @@ class DatabaseManager:
             fields["updated_at"] = datetime.now().isoformat()
             set_clause = ", ".join(f"{k} = ?" for k in fields)
             await self.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", *(list(fields.values()) + [user_id]))
+        from app.utils import get_cache
+        await get_cache().delete(f"user:info:{user_id}")
 
     async def get_all_users_with_reminders(self) -> list[dict]:
         return await self.fetch("SELECT * FROM users WHERE reminder_enabled = 1")
@@ -488,7 +500,7 @@ class DatabaseManager:
             """, user_id, session_id, user_message, bot_response, kwargs.get("detected_emotion"),
                kwargs.get("emotion_confidence"), kwargs.get("secondary_emotion"), 
                topics_json, is_diary)
-            return row["id"]
+            episode_id = row["id"]
         else:
             cursor = await self._db.execute("""
                 INSERT INTO episodes (user_id, session_id, user_message, bot_response, detected_emotion, 
@@ -498,15 +510,25 @@ class DatabaseManager:
                   kwargs.get("emotion_confidence"), kwargs.get("secondary_emotion"), 
                   topics_json, is_diary, now))
             await self._db.commit()
-            return cursor.lastrowid
+            episode_id = cursor.lastrowid
+        from app.utils import get_cache
+        await get_cache().delete_pattern(f"user:recent_episodes:{user_id}:*")
+        return episode_id
 
     async def get_recent_episodes(self, user_id: int, limit: int = 5) -> list[dict]:
+        from app.utils import get_cache
+        cache_key = f"user:recent_episodes:{user_id}:{limit}"
+        cached = await get_cache().get(cache_key)
+        if cached is not None:
+            return cached
         episodes = await self.fetch("SELECT * FROM episodes WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", user_id, limit)
         for ep in episodes:
             if ep.get("topics"):
                 try: ep["topics"] = json.loads(ep["topics"])
                 except: ep["topics"] = []
-        return list(reversed(episodes))
+        res = list(reversed(episodes))
+        await get_cache().set(cache_key, res, ttl=300)
+        return res
 
     async def get_episodes_by_emotion(self, user_id: int, emotion: str, limit: int = 5) -> list[dict]:
         return await self.fetch("SELECT * FROM episodes WHERE user_id = ? AND detected_emotion = ? ORDER BY timestamp DESC LIMIT ?", user_id, emotion, limit)
@@ -543,8 +565,16 @@ class DatabaseManager:
         return await self.fetch("SELECT * FROM episodes WHERE user_id = ? ORDER BY timestamp ASC", user_id)
 
     async def get_semantic_profile(self, user_id: int) -> dict | None:
+        from app.utils import get_cache
+        cache_key = f"user:profile:{user_id}"
+        cached = await get_cache().get(cache_key)
+        if cached is not None:
+            return cached
         row = await self.fetchrow("SELECT profile_data FROM semantic_profiles WHERE user_id = ?", user_id)
-        return json.loads(row["profile_data"]) if row else None
+        res = json.loads(row["profile_data"]) if row else None
+        if res:
+            await get_cache().set(cache_key, res, ttl=86400)
+        return res
 
     async def save_semantic_profile(self, user_id: int, profile: dict) -> None:
         now = datetime.now().isoformat()
@@ -552,6 +582,9 @@ class DatabaseManager:
             INSERT INTO semantic_profiles (user_id, profile_data, updated_at) VALUES (?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET profile_data = excluded.profile_data, updated_at = excluded.updated_at
         """, user_id, json.dumps(profile), now)
+        from app.utils import get_cache
+        await get_cache().delete(f"user:profile:{user_id}")
+        await get_cache().delete(f"user:memories:{user_id}")
 
     async def save_summary(self, user_id: int, summary_type: str, start: str, end: str, content: str, **kwargs) -> None:
         now = datetime.now().isoformat()
@@ -559,9 +592,18 @@ class DatabaseManager:
             INSERT INTO summaries (user_id, summary_type, period_start, period_end, content, emotional_trends, key_events, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, user_id, summary_type, start, end, content, json.dumps(kwargs.get("trends")), json.dumps(kwargs.get("events")), now)
+        from app.utils import get_cache
+        await get_cache().delete_pattern(f"user:summaries:{user_id}:*")
 
     async def get_recent_summaries(self, user_id: int, summary_type: str = "daily", limit: int = 3) -> list[dict]:
-        return await self.fetch("SELECT * FROM summaries WHERE user_id = ? AND summary_type = ? ORDER BY period_end DESC LIMIT ?", user_id, summary_type, limit)
+        from app.utils import get_cache
+        cache_key = f"user:summaries:{user_id}:{summary_type}:{limit}"
+        cached = await get_cache().get(cache_key)
+        if cached is not None:
+            return cached
+        res = await self.fetch("SELECT * FROM summaries WHERE user_id = ? AND summary_type = ? ORDER BY period_end DESC LIMIT ?", user_id, summary_type, limit)
+        await get_cache().set(cache_key, res, ttl=900)
+        return res
 
     async def get_all_summaries(self, user_id: int) -> list[dict]:
         return await self.fetch("SELECT * FROM summaries WHERE user_id = ? ORDER BY period_start ASC", user_id)
@@ -655,6 +697,8 @@ class DatabaseManager:
         
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         await self.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", *(list(fields.values()) + [user_id]))
+        from app.utils import get_cache
+        await get_cache().delete(f"user:info:{user_id}")
 
     async def get_all_users(self) -> list[dict]:
         return await self.fetch("SELECT * FROM users")
@@ -685,6 +729,9 @@ class DatabaseManager:
                 INSERT INTO memory_items (user_id, category, content, first_seen, last_seen, mention_count, is_resolved, importance)
                 VALUES (?, ?, ?, ?, ?, 1, 0, ?)
             """, user_id, category, content, now, now, importance)
+        from app.utils import get_cache
+        await get_cache().delete(f"user:memories:{user_id}")
+        await get_cache().delete(f"user:profile:{user_id}")
 
     async def rebuild_semantic_profile_cache(self, user_id: int) -> dict:
         from app.semantic_engine import DEFAULT_PROFILE
@@ -724,10 +771,17 @@ class DatabaseManager:
         return d
 
     async def get_active_memories(self, user_id: int) -> list[dict]:
-        return await self.fetch("""
+        from app.utils import get_cache
+        cache_key = f"user:memories:{user_id}"
+        cached = await get_cache().get(cache_key)
+        if cached is not None:
+            return cached
+        res = await self.fetch("""
             SELECT id, category, content FROM memory_items 
             WHERE user_id = ? AND is_resolved = 0
         """, user_id)
+        await get_cache().set(cache_key, res, ttl=1800)
+        return res
 
     async def get_all_memories(self, user_id: int) -> list[dict]:
         return await self.fetch("SELECT * FROM memory_items WHERE user_id = ?", user_id)
@@ -740,12 +794,15 @@ class DatabaseManager:
         
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         await self.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", *(list(fields.values()) + [user_id]))
+        from app.utils import get_cache
+        await get_cache().delete(f"user:info:{user_id}")
 
     async def get_episodes_with_embeddings(self, user_id: int) -> list[dict]:
         return await self.fetch("""
             SELECT id, user_id, user_message, bot_response, embedding, timestamp 
             FROM episodes 
             WHERE user_id = ? AND embedding IS NOT NULL
+            ORDER BY timestamp DESC LIMIT 50
         """, user_id)
 
     async def update_episode_embedding(self, user_id: int, episode_id: int, embedding: list[float]) -> None:
@@ -837,7 +894,7 @@ class DatabaseManager:
             """, user_id, vec_str, limit)
             return [self._parse_session_row(r) for r in rows]
             
-        rows = await self.fetch("SELECT * FROM sessions WHERE user_id = ? AND embedding IS NOT NULL", user_id)
+        rows = await self.fetch("SELECT * FROM sessions WHERE user_id = ? AND embedding IS NOT NULL ORDER BY start_time DESC LIMIT 20", user_id)
         if not rows:
             return []
             

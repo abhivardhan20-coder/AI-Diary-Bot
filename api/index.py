@@ -48,18 +48,7 @@ async def startup():
         await ptb_app.start()
         logger.info("PTB application started successfully.")
         
-        from app.config import WEBHOOK_URL, WEBHOOK_SECRET
-        if WEBHOOK_URL:
-            webhook_path = f"{WEBHOOK_URL}/webhook"
-            logger.info("Setting webhook to %s", webhook_path)
-            await ptb_app.bot.set_webhook(
-                url=webhook_path,
-                secret_token=WEBHOOK_SECRET,
-                drop_pending_updates=True
-            )
-            logger.info("Webhook set successfully.")
-        else:
-            logger.warning("WEBHOOK_URL is not set. Skipping automatic webhook registration.")
+        logger.info("Skipping automatic webhook registration on startup (handled on-demand via /setup-webhook to optimize cold starts).")
     except Exception as e:
         logger.error("PTB INIT/START FAILED: %s", e, exc_info=True)
 

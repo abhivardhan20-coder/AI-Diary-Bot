@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import app.config
 TEST_DB_PATH = Path(app.config.DATA_DIR) / "test_session_diary.db"
 app.config.DB_PATH = TEST_DB_PATH
+app.config.DATABASE_URL = ""
 
 from app.database import get_db
 from app.utils import get_llm
@@ -167,7 +168,7 @@ async def test_session_compaction_and_summarization(mock_llm):
     session = await db.get_session(user_id, session_id)
     assert session["title"] == "Discussing Python and Tests"
     assert session["summary"] == "The user talked about writing python tests for a session memory system."
-    assert session["importance_score"] == 0.8
+    assert round(session["importance_score"], 2) == 0.8
     assert session["emotion_metadata"]["primary_emotion"] == "happy"
     assert len(session["memories"]) == 2
     assert session["embedding"] is not None

@@ -9,6 +9,7 @@ from pathlib import Path
 import app.config
 TEST_DB_PATH = Path(app.config.DATA_DIR) / "test_diary.db"
 app.config.DB_PATH = TEST_DB_PATH
+app.config.DATABASE_URL = ""
 
 from app.database import get_db
 from app.utils import get_session_manager

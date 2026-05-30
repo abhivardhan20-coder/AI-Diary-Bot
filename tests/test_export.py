@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import app.config
 TEST_DB_PATH = Path(app.config.DATA_DIR) / "test_export_diary.db"
 app.config.DB_PATH = TEST_DB_PATH
+app.config.DATABASE_URL = ""
 
 from app.database import get_db
 from app.export_engine import parse_export_arguments, generate_export

@@ -105,6 +105,34 @@ class LLMClient:
         return await self._call_with_retry(messages, max_tokens=600, temperature=0.5)
 
     async def extract_single_fact(self, fact_type: str, text: str) -> str:
+        # Try deterministic regex extraction first to avoid LLM latency
+        text_clean = text.strip()
+        if "name" in fact_type.lower():
+            match = re.search(r"\b(?:my name is|i am|i'm|call me)\s+([A-Za-z]+)", text_clean, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            words = text_clean.split()
+            if len(words) <= 2 and all(w.isalpha() for w in words):
+                return text_clean
+        elif "age" in fact_type.lower():
+            match = re.search(r"\b\d+\b", text_clean)
+            if match:
+                return match.group(0)
+        elif "nationality" in fact_type.lower():
+            match = re.search(r"\b(?:i am|i'm)\s+([A-Za-z]+)", text_clean, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            words = text_clean.split()
+            if len(words) <= 2 and all(w.isalpha() for w in words):
+                return text_clean
+        elif "city" in fact_type.lower():
+            match = re.search(r"\b(?:in|at|live in)\s+([A-Za-z\s]+)", text_clean, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            words = text_clean.split()
+            if len(words) <= 2 and all(w.isalpha() for w in words):
+                return text_clean
+
         prompt = f"""\
 Extract the {fact_type} from the user's message.
 User message: "{text}"
@@ -306,6 +334,86 @@ def get_session_manager() -> UserSessionManager:
     if _session_manager_instance is None:
         _session_manager_instance = UserSessionManager()
     return _session_manager_instance
+
+_cache_instance = None
+
+
+class CacheManager:
+    def __init__(self):
+        self._local_cache = {}
+        self._local_lock = asyncio.Lock()
+
+    @property
+    def redis(self):
+        return get_session_manager()._redis
+
+    async def get(self, key: str):
+        r = self.redis
+        if r is not None:
+            try:
+                val = await r.get(key)
+                return json.loads(val) if val else None
+            except Exception as e:
+                logger.error("Redis get failed for key %s: %s", key, e)
+        
+        async with self._local_lock:
+            if key in self._local_cache:
+                val, expire_time = self._local_cache[key]
+                if datetime.now() < expire_time:
+                    return val
+                else:
+                    del self._local_cache[key]
+        return None
+
+    async def set(self, key: str, value, ttl: int = 300):
+        r = self.redis
+        if r is not None:
+            try:
+                await r.set(key, json.dumps(value), ex=ttl)
+                return
+            except Exception as e:
+                logger.error("Redis set failed for key %s: %s", key, e)
+        
+        async with self._local_lock:
+            expire_time = datetime.now() + timedelta(seconds=ttl)
+            self._local_cache[key] = (value, expire_time)
+
+    async def delete(self, key: str):
+        r = self.redis
+        if r is not None:
+            try:
+                await r.delete(key)
+                return
+            except Exception as e:
+                logger.error("Redis delete failed for key %s: %s", key, e)
+        
+        async with self._local_lock:
+            self._local_cache.pop(key, None)
+
+    async def delete_pattern(self, pattern: str):
+        r = self.redis
+        if r is not None:
+            try:
+                keys = await r.keys(pattern)
+                if keys:
+                    await r.delete(*keys)
+                return
+            except Exception as e:
+                logger.error("Redis delete_pattern failed for pattern %s: %s", pattern, e)
+        
+        async with self._local_lock:
+            import fnmatch
+            keys_to_del = [k for k in self._local_cache.keys() if fnmatch.fnmatch(k, pattern)]
+            for k in keys_to_del:
+                self._local_cache.pop(k, None)
+
+
+def get_cache() -> CacheManager:
+    global _cache_instance
+    if _cache_instance is None:
+        _cache_instance = CacheManager()
+    return _cache_instance
+
 
 
 async def is_duplicate_update(update_id: int) -> bool:

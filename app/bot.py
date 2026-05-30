@@ -29,9 +29,10 @@ from app.utils import get_llm, get_session_manager
 
 logger = logging.getLogger(__name__)
 
-async def determine_relationship_stage(user_id: int) -> str:
+async def determine_relationship_stage(user_id: int, user_info: dict | None = None) -> str:
     db = get_db()
-    user_info = await db.get_user(user_id)
+    if not user_info:
+        user_info = await db.get_user(user_id)
     if not user_info:
         return "new"
     
@@ -273,7 +274,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_chat_action(ChatAction.TYPING)
         
         # 1. Determine relationship stage
-        stage = await determine_relationship_stage(user_id)
+        stage = await determine_relationship_stage(user_id, user_info=user_info)
         
         # 2. Classify message type and compute token limit/instruction
         from app.prompts import STAGE_DIRECTIVES
@@ -336,7 +337,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             directive = "Directive: Respond as long as needed to fulfill the task helper request."
     
         # 3. Fetch contexts
-        ctx = await build_context(user_id, text)
+        ctx = await build_context(user_id, text, user_info=user_info, classification=classification)
         
         profile = await get_profile(user_id)
         name = profile.get("name") or user_info.get("first_name") or update.effective_user.first_name or "friend"
@@ -372,20 +373,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response)
             
             async def enrich():
-                async with get_session_manager().lock_user(user_id):
-                    try:
-                        emo = await analyze_emotion(text, response)
-                        topics_json = json.dumps(emo.get("topics", []))
-                        await db.execute("""
-                            UPDATE episodes 
-                            SET detected_emotion = ?, emotion_confidence = ?, secondary_emotion = ?, topics = ?
-                            WHERE id = ? AND user_id = ?
-                        """, emo.get("emotion"), emo.get("confidence"), emo.get("secondary_emotion"), topics_json, episode_id, user_id)
-                        
-                        await update_profile_from_conversation(user_id, text, response)
-                        await db.update_user(user_id, last_seen=datetime.now().isoformat())
-                    except Exception as e:
-                        logger.error("Background enrichment failed for user %d: %s", user_id, e)
+                try:
+                    emo = await analyze_emotion(text, response)
+                    topics_json = json.dumps(emo.get("topics", []))
+                    await db.execute("""
+                        UPDATE episodes 
+                        SET detected_emotion = ?, emotion_confidence = ?, secondary_emotion = ?, topics = ?
+                        WHERE id = ? AND user_id = ?
+                    """, emo.get("emotion"), emo.get("confidence"), emo.get("secondary_emotion"), topics_json, episode_id, user_id)
+                    
+                    await update_profile_from_conversation(user_id, text, response)
+                    await db.update_user(user_id, last_seen=datetime.now().isoformat())
+                except Exception as e:
+                    logger.error("Background enrichment failed for user %d: %s", user_id, e)
                         
             asyncio.create_task(enrich())
         except Exception as e:
