@@ -43,11 +43,32 @@ async def startup():
         logger.info("Starting PTB application initialization...")
         await ptb_app.initialize()
         logger.info("PTB application initialized successfully.")
+        
+        # Start PTB application
+        await ptb_app.start()
+        logger.info("PTB application started successfully.")
+        
+        from app.config import WEBHOOK_URL, WEBHOOK_SECRET
+        if WEBHOOK_URL:
+            webhook_path = f"{WEBHOOK_URL}/webhook"
+            logger.info("Setting webhook to %s", webhook_path)
+            await ptb_app.bot.set_webhook(
+                url=webhook_path,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=True
+            )
+            logger.info("Webhook set successfully.")
+        else:
+            logger.warning("WEBHOOK_URL is not set. Skipping automatic webhook registration.")
     except Exception as e:
-        logger.error("PTB INIT FAILED: %s", e, exc_info=True)
+        logger.error("PTB INIT/START FAILED: %s", e, exc_info=True)
 
 @app.on_event("shutdown")
 async def shutdown():
+    try:
+        await ptb_app.stop()
+    except Exception as e:
+        logger.error("Error stopping PTB app: %s", e)
     await ptb_app.shutdown()
     await get_db().close()
 
@@ -58,6 +79,45 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/setup-webhook")
+async def setup_webhook(request: Request):
+    from app.config import WEBHOOK_URL, WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN
+    
+    # Use config WEBHOOK_URL if set, otherwise detect dynamically from request
+    base_url = WEBHOOK_URL.rstrip('/') if WEBHOOK_URL else str(request.base_url).rstrip('/')
+    # Force HTTPS on Vercel
+    if "localhost" not in base_url and not base_url.startswith("https://"):
+        base_url = base_url.replace("http://", "https://")
+    webhook_path = f"{base_url}/webhook"
+    
+    logger.info("Setting webhook to %s", webhook_path)
+    try:
+        success = await ptb_app.bot.set_webhook(
+            url=webhook_path,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=False
+        )
+        
+        try:
+            await ptb_app.start()
+        except Exception as start_err:
+            logger.warning("Bot already started or start failed: %s", start_err)
+            
+        return {
+            "status": "success" if success else "failed",
+            "webhook_url": webhook_path,
+            "secret_token_configured": bool(WEBHOOK_SECRET),
+            "bot_token_configured": bool(TELEGRAM_BOT_TOKEN),
+            "info": "Webhook set successfully. Try messaging your bot now!"
+        }
+    except Exception as e:
+        logger.error("Failed to set webhook: %s", e, exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "webhook_url": webhook_path
+        }
 
 @app.post("/webhook")
 async def webhook(request: Request):
