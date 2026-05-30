@@ -329,8 +329,11 @@ class DatabaseManager:
                 url = DATABASE_URL
                 if url.startswith("postgres://"):
                     url = url.replace("postgres://", "postgresql://", 1)
-                
-                self._pool = await asyncpg.create_pool(url)
+                self._pool = await asyncpg.create_pool(
+                    url,
+                    min_size=1,
+                    max_size=2
+                )
                 self._is_postgres = True
                 
                 async with self._pool.acquire() as conn:
@@ -385,9 +388,15 @@ class DatabaseManager:
             raise RuntimeError("Database not initialized")
         return self._db
 
+    async def _ensure_initialized(self) -> None:
+        if not self._initialized:
+            logger.info("Database was not initialized. Initializing on-demand...")
+            await self.initialize()
+
     # --- Query wrappers supporting both dialects ---
 
     async def execute(self, query: str, *args) -> None:
+        await self._ensure_initialized()
         query_fmt = _sql(query, self._is_postgres)
         if self._is_postgres:
             async with self._pool.acquire() as conn:
@@ -397,6 +406,7 @@ class DatabaseManager:
             await self._db.commit()
 
     async def fetch(self, query: str, *args) -> list[dict]:
+        await self._ensure_initialized()
         query_fmt = _sql(query, self._is_postgres)
         if self._is_postgres:
             async with self._pool.acquire() as conn:
@@ -408,6 +418,7 @@ class DatabaseManager:
             return [dict(r) for r in rows]
 
     async def fetchrow(self, query: str, *args) -> dict | None:
+        await self._ensure_initialized()
         query_fmt = _sql(query, self._is_postgres)
         if self._is_postgres:
             async with self._pool.acquire() as conn:
