@@ -10,7 +10,6 @@ from app.bot import build_ptb_application
 from app.database import get_db
 from app.utils import check_and_generate_summaries
 from app.semantic_engine import curate_user_profile
-from app.scheduler import check_and_send_reminders
 
 logger = logging.getLogger(__name__)
 
