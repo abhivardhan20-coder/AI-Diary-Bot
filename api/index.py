@@ -116,18 +116,34 @@ async def cron_daily(request: Request):
         return {"status": "failed", "error": str(e)}
     return {"status": "success"}
 
-@app.get("/cron/reminder")
-async def cron_reminder(request: Request):
-    client_host = request.client.host if request.client else "unknown"
-    if CRON_SECRET:
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or auth_header != f"Bearer {CRON_SECRET}":
-            logger.warning("Unauthorized cron attempt from IP %s with invalid secret", client_host)
+@app.post("/qstash-reminder")
+async def qstash_reminder(request: Request):
+    from qstash import Receiver
+    from app.config import QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY
+    
+    if not QSTASH_CURRENT_SIGNING_KEY:
+        logger.warning("No QStash signing keys configured. Proceeding without signature validation.")
+    else:
+        receiver = Receiver(
+            current_signing_key=QSTASH_CURRENT_SIGNING_KEY,
+            next_signing_key=QSTASH_NEXT_SIGNING_KEY
+        )
+        body = await request.body()
+        signature = request.headers.get("Upstash-Signature")
+        try:
+            receiver.verify(body=body.decode("utf-8"), signature=signature)
+        except Exception as e:
+            logger.warning("QStash signature verification failed: %s", e)
             return Response(status_code=status.HTTP_401_UNAUTHORIZED)
-    logger.info("Executing Vercel Cron: Scheduled Diary Reminders")
+            
     try:
-        await check_and_send_reminders(ptb_app)
+        data = await request.json()
+        user_id = data.get("user_id")
+        if user_id:
+            from app.scheduler import send_reminder_now
+            await send_reminder_now(ptb_app, user_id)
     except Exception as e:
-        logger.error("Reminders cron failed: %s", e)
-        return {"status": "failed", "error": str(e)}
+        logger.error("Error processing QStash reminder: %s", e)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
     return {"status": "success"}

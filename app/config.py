@@ -15,6 +15,9 @@ IS_VERCEL: bool = os.getenv("VERCEL") is not None
 # ── Secrets & Core Env ──────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+QSTASH_TOKEN: str = os.getenv("QSTASH_TOKEN", "")
+QSTASH_CURRENT_SIGNING_KEY: str = os.getenv("QSTASH_CURRENT_SIGNING_KEY", "")
+QSTASH_NEXT_SIGNING_KEY: str = os.getenv("QSTASH_NEXT_SIGNING_KEY", "")
 
 # Webhook Settings
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")  # e.g., https://your-app.up.railway.app

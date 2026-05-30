@@ -24,10 +24,6 @@
     {
       "path": "/cron/daily",
       "schedule": "0 2 * * *"
-    },
-    {
-      "path": "/cron/reminder",
-      "schedule": "*/15 * * * *"
     }
   ]
 }
