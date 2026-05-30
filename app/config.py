@@ -21,7 +21,7 @@ QSTASH_NEXT_SIGNING_KEY: str = os.getenv("QSTASH_NEXT_SIGNING_KEY", "")
 
 # Webhook Settings
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")  # e.g., https://your-app.up.railway.app
-WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "super-secret-token")
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
 CRON_SECRET: str = os.getenv("CRON_SECRET", "")
 PORT: int = int(os.getenv("PORT", "8000"))
 
@@ -69,14 +69,20 @@ LOG_FORMAT: str = "%(asctime)s | %(name)-20s | %(levelname)-7s | %(message)s"
 
 def validate_config():
     """Fail fast if required environment variables are missing."""
+    import sys
+    is_testing = "pytest" in sys.modules
+    
     missing = []
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not OPENROUTER_API_KEY:
         missing.append("OPENROUTER_API_KEY")
-    if not WEBHOOK_URL:
-        # We don't fail here because local testing might use polling or tunnel
-        print("WARNING: WEBHOOK_URL is not set. Bot will only work in polling mode if manually started.")
     
+    if not is_testing:
+        if not WEBHOOK_SECRET:
+            missing.append("WEBHOOK_SECRET")
+        if not CRON_SECRET:
+            missing.append("CRON_SECRET")
+            
     if missing:
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")

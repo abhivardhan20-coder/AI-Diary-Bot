@@ -5,8 +5,9 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 from telegram import Update
 
-from app.config import WEBHOOK_SECRET, CRON_SECRET
-from app.bot import build_ptb_application
+from contextlib import asynccontextmanager
+from app.config import WEBHOOK_SECRET, CRON_SECRET, validate_config
+from app.bot import get_ptb_app
 from app.database import get_db
 from app.utils import check_and_generate_summaries
 from app.semantic_engine import curate_user_profile
@@ -14,11 +15,73 @@ from app.semantic_engine import curate_user_profile
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-# Expose app for Vercel
-app = FastAPI()
+# Global bot application instance using the singleton
+ptb_app = get_ptb_app()
 
-# Global bot application instance
-ptb_app = build_ptb_application()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Unified application lifespan manager."""
+    # STARTUP
+    try:
+        # Validate environment variables first to fail fast
+        validate_config()
+    except Exception as e:
+        logger.critical("Configuration validation failed: %s", e)
+        raise e
+
+    try:
+        logger.info("Starting database initialization...")
+        await get_db().initialize()
+        logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error("DATABASE INIT FAILED: %s", e, exc_info=True)
+        # Don't re-raise — let the app start so we can at least see health/root endpoints
+
+    try:
+        from app.config import IS_VERCEL, WEBHOOK_URL
+        logger.info("Starting PTB application initialization...")
+        await ptb_app.initialize()
+        logger.info("PTB application initialized successfully.")
+        
+        # Start PTB application
+        await ptb_app.start()
+        logger.info("PTB application started successfully.")
+        
+        if not IS_VERCEL:
+            # Long-running server (Railway / Local): setup webhook or polling
+            if WEBHOOK_URL:
+                webhook_path = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+                logger.info("Setting webhook to %s", webhook_path)
+                await ptb_app.bot.set_webhook(
+                    url=webhook_path,
+                    secret_token=WEBHOOK_SECRET,
+                    drop_pending_updates=True
+                )
+            else:
+                logger.info("WEBHOOK_URL not set. Falling back to POLLING mode...")
+                await ptb_app.updater.start_polling()
+        else:
+            logger.info("Skipping automatic webhook registration on startup (handled on-demand via /setup-webhook to optimize Vercel cold starts).")
+    except Exception as e:
+        logger.error("PTB INIT/START FAILED: %s", e, exc_info=True)
+
+    yield
+
+    # SHUTDOWN
+    logger.info("Shutting down application...")
+    try:
+        from app.config import IS_VERCEL, WEBHOOK_URL
+        if not IS_VERCEL and not WEBHOOK_URL:
+            await ptb_app.updater.stop()
+        await ptb_app.stop()
+    except Exception as e:
+        logger.error("Error stopping PTB app: %s", e)
+    await ptb_app.shutdown()
+    await get_db().close()
+    logger.info("Application shutdown completed.")
+
+# Expose app for Vercel with lifespan
+app = FastAPI(lifespan=lifespan)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -30,36 +93,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal Server Error"}
     )
 
-@app.on_event("startup")
-async def startup():
-    try:
-        logger.info("Starting database initialization...")
-        await get_db().initialize()
-        logger.info("Database initialized successfully.")
-    except Exception as e:
-        logger.error("DATABASE INIT FAILED: %s", e, exc_info=True)
-        # Don't re-raise — let the app start so we can at least see health/root endpoints
-    try:
-        logger.info("Starting PTB application initialization...")
-        await ptb_app.initialize()
-        logger.info("PTB application initialized successfully.")
-        
-        # Start PTB application
-        await ptb_app.start()
-        logger.info("PTB application started successfully.")
-        
-        logger.info("Skipping automatic webhook registration on startup (handled on-demand via /setup-webhook to optimize cold starts).")
-    except Exception as e:
-        logger.error("PTB INIT/START FAILED: %s", e, exc_info=True)
 
-@app.on_event("shutdown")
-async def shutdown():
-    try:
-        await ptb_app.stop()
-    except Exception as e:
-        logger.error("Error stopping PTB app: %s", e)
-    await ptb_app.shutdown()
-    await get_db().close()
 
 @app.get("/")
 async def root():
@@ -71,6 +105,12 @@ async def health():
 
 @app.get("/setup-webhook")
 async def setup_webhook(request: Request):
+    # SEC-2 [CRITICAL]: setup-webhook Endpoint Has No Authentication
+    token = request.headers.get("X-Admin-Token") or request.query_params.get("token", "")
+    if not CRON_SECRET or token != CRON_SECRET:
+        logger.warning("Unauthorized /setup-webhook attempt")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
     from app.config import WEBHOOK_URL, WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN
     
     # Use config WEBHOOK_URL if set, otherwise detect dynamically from request

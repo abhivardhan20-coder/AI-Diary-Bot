@@ -3,8 +3,10 @@ import re
 import json
 import zipfile
 import logging
+import secrets
 from datetime import datetime
 from app.database import get_db
+from app.config import EXPORT_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -152,9 +154,17 @@ async def generate_export(user_id: int, options: dict) -> tuple[str, str]:
         if options["start_date"] and options["end_date"]:
             all_sessions = [s for s in all_sessions if options["start_date"] <= s.get("date") <= options["end_date"]]
             
+        # N+1 optimization: batch fetch all user episodes in a single query
+        all_episodes = await db.get_all_episodes(user_id)
+        episodes_by_session = {}
+        for ep in all_episodes:
+            sid = ep.get("session_id")
+            if sid:
+                episodes_by_session.setdefault(sid, []).append(ep)
+                
         sessions_list = []
         for s in all_sessions:
-            episodes = await db.get_episodes_for_session(user_id, s["session_id"])
+            episodes = episodes_by_session.get(s["session_id"], [])
             messages = []
             for ep in episodes:
                 messages.append({
@@ -241,24 +251,21 @@ async def generate_export(user_id: int, options: dict) -> tuple[str, str]:
             "history": emotions_history
         }
 
-    # Ensure output exports/ directory exists
-    os.makedirs("exports", exist_ok=True)
+    # Ensure output exports directory exists
+    os.makedirs(str(EXPORT_DIR), exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = f"export_{user_id}_{ts}"
+    opaque_token = secrets.token_hex(16)
+    friendly_name = f"eva_export_{ts}.{options['format']}"
     
-    raw_path = None
-    file_name = None
+    raw_opaque_name = f"{opaque_token}.{options['format']}"
+    raw_path = os.path.join(str(EXPORT_DIR), raw_opaque_name)
     
     # Render file content based on selected format
     if options["format"] == "json":
-        raw_path = f"exports/{base_name}.json"
         with open(raw_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        file_name = f"{base_name}.json"
         
     elif options["format"] == "txt":
-        raw_path = f"exports/{base_name}.txt"
-        file_name = f"{base_name}.txt"
         with open(raw_path, "w", encoding="utf-8") as f:
             f.write(f"==================================================\n")
             f.write(f"         AI DIARY COMPANION ARCHIVE EXPORT        \n")
@@ -299,8 +306,6 @@ async def generate_export(user_id: int, options: dict) -> tuple[str, str]:
                 f.write("\n")
 
     elif options["format"] == "md":
-        raw_path = f"exports/{base_name}.md"
-        file_name = f"{base_name}.md"
         with open(raw_path, "w", encoding="utf-8") as f:
             f.write(f"# AI Companion History Archive\n\n")
             f.write(f"* **User ID**: `{user_id}`\n")
@@ -340,9 +345,12 @@ async def generate_export(user_id: int, options: dict) -> tuple[str, str]:
     # If zipped compression is requested OR file size exceeds 1 MB (1048576 bytes)
     file_size = os.path.getsize(raw_path)
     if options["zip"] or file_size > 1048576:
-        zip_path = f"exports/{base_name}.zip"
+        zip_opaque_name = f"{secrets.token_hex(16)}.zip"
+        zip_path = os.path.join(str(EXPORT_DIR), zip_opaque_name)
+        zip_friendly_name = f"eva_export_{ts}.zip"
+        
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(raw_path, arcname=file_name)
+            zipf.write(raw_path, arcname=friendly_name)
         
         # Clean up the raw unzipped temporary file
         try:
@@ -350,6 +358,6 @@ async def generate_export(user_id: int, options: dict) -> tuple[str, str]:
         except OSError:
             pass
             
-        return zip_path, f"{base_name}.zip"
+        return zip_path, zip_friendly_name
 
-    return raw_path, file_name
+    return raw_path, friendly_name

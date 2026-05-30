@@ -31,45 +31,51 @@ async def get_profile(user_id: int) -> dict:
 from datetime import datetime
 
 async def update_profile_from_conversation(user_id: int, user_message: str, bot_response: str):
-    db = get_db()
-    current = await get_profile(user_id)
-    
-    # Retrieve pending topics
-    user_info = await db.get_user(user_id)
-    pending_topics = []
-    if user_info and user_info.get("pending_topics"):
-        try:
-            pending_topics = json.loads(user_info["pending_topics"])
-        except Exception:
-            pass
-            
-    profile_for_prompt = deepcopy(current)
-    profile_for_prompt["pending_topics"] = pending_topics
-    
-    prompt = PROFILE_EXTRACTION_PROMPT.format(
-        user_message=user_message, bot_response=bot_response,
-        current_profile=json.dumps(profile_for_prompt, indent=2)
-    )
-    updates = await get_llm().extract_profile(prompt)
-    if not updates or updates.get("no_update"): return
-    
-    # Save pending topics if updated
-    if "pending_topics" in updates and isinstance(updates["pending_topics"], list):
-        await db.update_user(user_id, pending_topics=json.dumps(updates["pending_topics"]))
+    # Cost optimization: Skip for very short messages
+    if len(user_message.split()) < 6:
+        return
         
-    # Write updates to memory_items
-    for key, val in updates.items():
-        if key in ("no_update", "pending_topics"): continue
-        if val is None: continue
+    from app.utils import get_session_manager
+    async with get_session_manager().lock_user(user_id):
+        db = get_db()
+        current = await get_profile(user_id)
         
-        if key == "name":
-            await db.upsert_memory_item(user_id, "name", val)
-        elif key in DEFAULT_PROFILE and isinstance(DEFAULT_PROFILE[key], list) and isinstance(val, list):
-            for item in val:
-                await db.upsert_memory_item(user_id, key, item)
+        # Retrieve pending topics
+        user_info = await db.get_user(user_id)
+        pending_topics = []
+        if user_info and user_info.get("pending_topics"):
+            try:
+                pending_topics = json.loads(user_info["pending_topics"])
+            except Exception:
+                pass
                 
-    # Rebuild cached semantic profile from memory_items
-    await db.rebuild_semantic_profile_cache(user_id)
+        profile_for_prompt = deepcopy(current)
+        profile_for_prompt["pending_topics"] = pending_topics
+        
+        prompt = PROFILE_EXTRACTION_PROMPT.format(
+            user_message=user_message, bot_response=bot_response,
+            current_profile=json.dumps(profile_for_prompt, indent=2)
+        )
+        updates = await get_llm().extract_profile(prompt)
+        if not updates or updates.get("no_update"): return
+        
+        # Save pending topics if updated
+        if "pending_topics" in updates and isinstance(updates["pending_topics"], list):
+            await db.update_user(user_id, pending_topics=json.dumps(updates["pending_topics"]))
+            
+        # Write updates to memory_items
+        for key, val in updates.items():
+            if key in ("no_update", "pending_topics"): continue
+            if val is None: continue
+            
+            if key == "name":
+                await db.upsert_memory_item(user_id, "name", val)
+            elif key in DEFAULT_PROFILE and isinstance(DEFAULT_PROFILE[key], list) and isinstance(val, list):
+                for item in val:
+                    await db.upsert_memory_item(user_id, key, item)
+                    
+        # Rebuild cached semantic profile from memory_items
+        await db.rebuild_semantic_profile_cache(user_id)
 
 def _merge_profile(current: dict, updates: dict) -> dict:
     merged = deepcopy(current)
@@ -85,31 +91,8 @@ def _merge_profile(current: dict, updates: dict) -> dict:
 
 async def decay_memories(user_id: int):
     db = get_db()
-    cursor = await db.db.execute("""
-        SELECT id, category, importance 
-        FROM memory_items 
-        WHERE user_id = ? AND is_resolved = 0
-    """, (user_id,))
-    rows = await cursor.fetchall()
-    
-    for r in rows:
-        mid = r["id"]
-        cat = r["category"]
-        imp = r["importance"]
-        
-        # High importance categories decay very slowly, minor ones decay faster
-        if cat in ["goals", "relationships", "important_events", "personality_traits", "fears", "aspirations", "strengths"]:
-            decay_rate = 0.98
-        else:
-            decay_rate = 0.90
-            
-        new_imp = imp * decay_rate
-        if new_imp < 0.15:
-            await db.db.execute("UPDATE memory_items SET is_resolved = 1, importance = ? WHERE id = ? AND user_id = ?", (new_imp, mid, user_id))
-        else:
-            await db.db.execute("UPDATE memory_items SET importance = ? WHERE id = ? AND user_id = ?", (new_imp, mid, user_id))
-            
-    await db.db.commit()
+    # Call the batched database layer method to avoid raw db cursor / connection leaks
+    await db.decay_memory_items(user_id)
     await db.rebuild_semantic_profile_cache(user_id)
     logger.info("Decayed memory items for user %d", user_id)
 
@@ -129,8 +112,7 @@ async def curate_user_profile(user_id: int):
         if (now - last_dt).days < 7:
             return  # Run weekly LLM curation only once a week
             
-    cursor = await db.db.execute("SELECT id, category, content FROM memory_items WHERE user_id = ? AND is_resolved = 0", (user_id,))
-    rows = await cursor.fetchall()
+    rows = await db.fetch("SELECT id, category, content FROM memory_items WHERE user_id = ? AND is_resolved = 0", user_id)
     if not rows: return
     
     memory_items_str = "\n".join([f"ID: {r['id']} | Category: {r['category']} | Content: {r['content']}" for r in rows])
@@ -142,9 +124,10 @@ async def curate_user_profile(user_id: int):
     res = await llm._call_json(prompt)
     if res and res.get("resolved_ids"):
         resolved_ids = res["resolved_ids"]
-        for item_id in resolved_ids:
-            await db.db.execute("UPDATE memory_items SET is_resolved = 1 WHERE id = ? AND user_id = ?", (item_id, user_id))
-        await db.db.commit()
+        # Update resolved items in a single batch query instead of a loop
+        if resolved_ids:
+            placeholders = ", ".join("?" for _ in resolved_ids)
+            await db.execute(f"UPDATE memory_items SET is_resolved = 1 WHERE user_id = ? AND id IN ({placeholders})", user_id, *resolved_ids)
         await db.rebuild_semantic_profile_cache(user_id)
         logger.info("Weekly profile curation completed for user %d. Marked resolved IDs: %s", user_id, resolved_ids)
         

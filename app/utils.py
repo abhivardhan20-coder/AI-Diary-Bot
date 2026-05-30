@@ -144,21 +144,27 @@ Do not include any other text, quotes, or markdown.
         return res.strip()
 
     async def embed_text(self, text: str) -> list[float] | None:
+        import hashlib
+        cache = get_cache()
+        key = "emb:" + hashlib.md5(text.encode('utf-8')).hexdigest()
+        try:
+            cached = await cache.get(key)
+            if cached is not None:
+                return cached
+        except Exception as e:
+            logger.error("Failed to fetch cached embedding: %s", e)
+
         try:
             response = await self._client.embeddings.create(
                 model="text-embedding-3-small",
                 input=text
             )
-            return response.data[0].embedding
+            vec = response.data[0].embedding
+            await cache.set(key, vec, ttl=3600)  # 1 hour TTL
+            return vec
         except Exception as e:
-            logger.warning("Failed to generate embedding: %s. Using mock embedding.", e)
-            import hashlib
-            h = hashlib.sha256(text.encode('utf-8')).digest()
-            mock_vec = []
-            for i in range(1536):
-                val = ((h[i % 32] * (i + 1)) % 1000) / 500.0 - 1.0
-                mock_vec.append(val)
-            return mock_vec
+            logger.error("Embedding service failed: %s", e)
+            return None
 
 _llm_instance: LLMClient | None = None
 
@@ -446,28 +452,50 @@ async def log_unusual_traffic(user_id: int) -> int | None:
     return None
 
 
+import time
+
+_in_mem_counters: dict[str, tuple[int, float]] = {}  # {key: (count, expires_at)}
+_in_mem_lock = asyncio.Lock()
+
+async def _check_local_rate_limit(key: str, limit: int, window: int) -> bool:
+    now = time.time()
+    async with _in_mem_lock:
+        # Clean up expired keys to prevent memory growth
+        expired_keys = [k for k, (_, exp) in _in_mem_counters.items() if now > exp]
+        for k in expired_keys:
+            _in_mem_counters.pop(k, None)
+            
+        count, exp = _in_mem_counters.get(key, (0, 0.0))
+        if now > exp:
+            count, exp = 0, now + window
+        count += 1
+        _in_mem_counters[key] = (count, exp)
+        return count <= limit
+
 async def check_rate_limit(user_id: int, action: str, limit: int, window: int) -> bool:
     """
     Check if user has exceeded the rate limit for a specific action.
     Returns True if allowed (limit not exceeded), False if rate-limited (limit exceeded).
     """
     manager = get_session_manager()
-    if manager._redis is None:
-        return True  # Fallback to allow if Redis is not configured (local dev)
-        
     key = f"ratelimit:{action}:{user_id}"
+    
+    if manager._redis is None:
+        return await _check_local_rate_limit(key, limit, window)
+        
     try:
         pipe = manager._redis.pipeline()
         pipe.incr(key)
         pipe.expire(key, window)
         res = await pipe.execute()
         count = res[0]
-        if count > limit:
-            return False
+        return count <= limit
     except Exception as e:
-        logger.error("Rate limit check failed for user %d: %s", user_id, e)
-        return True  # Fail-open
-    return True
+        logger.error("Rate limit Redis error for user %d: %s. Falling back to local in-memory rate limiting.", user_id, e)
+        # Degrade gracefully by using in-memory local limiter
+        local_key = f"local:{action}:{user_id}"
+        return await _check_local_rate_limit(local_key, limit, window)
+
 
 
 

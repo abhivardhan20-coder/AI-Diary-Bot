@@ -41,6 +41,8 @@ def deterministic_extract_keywords(text: str) -> list[str]:
             unique_keywords.append(kw)
     return unique_keywords[:3]
 
+from datetime import datetime, timezone
+
 def deterministic_rerank(candidates: list[dict], current_message: str, query_vector: list[float] | None, keywords: list[str]) -> list[dict]:
     scored = []
     for c in candidates:
@@ -63,7 +65,18 @@ def deterministic_rerank(candidates: list[dict], current_message: str, query_vec
         msg_lower = (c.get("user_message", "") + " " + c.get("bot_response", "")).lower()
         kw_overlap = sum(1 for kw in keywords if kw in msg_lower)
         
-        score = vec_sim * 0.7 + (kw_overlap * 0.1)
+        # Temporal decay: half-life of 30 days
+        try:
+            ts = datetime.fromisoformat(c['timestamp'])
+            if ts.tzinfo is not None:
+                ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+            now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+            days_ago = max(0, (now_naive - ts).days)
+        except Exception:
+            days_ago = 30
+        recency = 0.5 ** (days_ago / 30)
+        
+        score = vec_sim * 0.6 + (kw_overlap * 0.1) + (recency * 0.3)
         scored.append((score, c))
         
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -116,15 +129,26 @@ async def get_vector_search_candidates(user_id: int, query_text: str, limit: int
     scored_episodes.sort(key=lambda x: x[0], reverse=True)
     return [ep for sim, ep in scored_episodes[:limit]]
 
+def deduplicate_context(profile_str: str, memories_str: str) -> str:
+    """Strip lines from retrieved_memories that overlap too much with terms in the profile context."""
+    profile_terms = set(re.findall(r'\b[a-z]{4,}\b', profile_str.lower()))
+    lines = []
+    for line in memories_str.split('\n'):
+        words = set(re.findall(r'\b[a-z]{4,}\b', line.lower()))
+        overlap = words & profile_terms
+        # Keep if the line has a low amount of shared terms (less than 5)
+        if len(overlap) < 5:
+            lines.append(line)
+    return '\n'.join(lines)
+
 async def build_context(user_id: int, current_message: str, user_info: dict | None = None, classification: str = "question") -> dict:
     db = get_db()
     llm = get_llm()
     
-    # 1. Parallelize initial profile, history, and summary fetches
+    # 1. Parallelize initial profile and history fetches
     tasks = [
         get_profile(user_id),
         db.get_recent_episodes(user_id, limit=4),
-        db.get_recent_summaries(user_id, "weekly", limit=1),
     ]
     
     user_info_idx = -1
@@ -141,7 +165,6 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
     results = await asyncio.gather(*tasks)
     profile = results[0]
     recent = results[1]
-    weekly_summaries = results[2]
     
     if user_info_idx != -1:
         user_info = results[user_info_idx]
@@ -203,23 +226,22 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
         if not keywords:
             keywords = [current_message]
             
-        # Get query vector (already generated concurrently in the initial gather)
-        
+        all_search_tasks = []
+        vector_task_count = 0
         if query_vector:
-            # Parallelize vector searches and keyword searches on both episodes and sessions
-            all_search_tasks = [
-                get_vector_search_candidates(user_id, current_message, limit=10, query_vector=query_vector),
-                db.get_vector_session_candidates(user_id, query_vector, limit=3)
-            ]
-            for kw in keywords:
-                all_search_tasks.append(db.search_episodes(user_id, kw, limit=10))
-                all_search_tasks.append(db.search_sessions(user_id, kw, limit=3))
-                
+            all_search_tasks.append(get_vector_search_candidates(user_id, current_message, limit=10, query_vector=query_vector))
+            all_search_tasks.append(db.get_vector_session_candidates(user_id, query_vector, limit=3))
+            vector_task_count = 2
+            
+        for kw in keywords:
+            all_search_tasks.append(db.search_episodes(user_id, kw, limit=10))
+            all_search_tasks.append(db.search_sessions(user_id, kw, limit=3))
+            
+        if all_search_tasks:
             search_results = await asyncio.gather(*all_search_tasks)
             
-            # Process episodes
-            vector_episodes = search_results[0]
-            vector_sessions = search_results[1]
+            vector_episodes = search_results[0] if query_vector else []
+            vector_sessions = search_results[1] if query_vector else []
             
             candidates = []
             seen_ids = set()
@@ -231,7 +253,7 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
                     candidates.append(r)
                     
             # Process keyword episodes
-            for idx in range(2, len(search_results), 2):
+            for idx in range(vector_task_count, len(search_results), 2):
                 ep_list = search_results[idx]
                 for r in ep_list:
                     if r["id"] not in seen_ids and r["id"] not in recent_ids:
@@ -250,7 +272,7 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
                     seen_session_ids.add(s["session_id"])
                     sessions_candidates.append(s)
                     
-            for idx in range(3, len(search_results), 2):
+            for idx in range(vector_task_count + 1, len(search_results), 2):
                 s_list = search_results[idx]
                 for s in s_list:
                     if s["session_id"] not in seen_session_ids:
@@ -296,10 +318,9 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
                 
             if blocks:
                 retrieved_memories = "\n\n".join(blocks)
+                # Deduplicate retrieved memories against the user profile context
+                retrieved_memories = deduplicate_context(full_profile_context, retrieved_memories)
                 
-    # Process weekly summary
-    weekly_summary = weekly_summaries[0]["content"] if weekly_summaries else "No weekly summaries generated yet."
-    
     # Process pending topics
     pending_topics = []
     if user_info and user_info.get("pending_topics"):
@@ -313,7 +334,6 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
         "temporal_context": temporal_context,
         "retrieved_memories": retrieved_memories,
         "history": history,
-        "weekly_summary": weekly_summary,
         "pending_topics": pending_topics,
         "profile": profile,
     }

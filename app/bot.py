@@ -3,6 +3,7 @@ Telegram Bot core logic and handler registration.
 Modified for production webhook usage.
 """
 
+import uuid
 import logging
 import asyncio
 import json
@@ -19,13 +20,13 @@ from telegram.constants import ChatAction
 
 from app.config import TELEGRAM_BOT_TOKEN, DEFAULT_TIMEZONE, DEFAULT_REMINDER_TIME
 from app.database import get_db
-from app.memory_engine import get_memory_summary, save_episode, analyze_emotion
+from app.memory_engine import get_memory_summary, save_episode, analyze_emotion, compact_session
 from app.retrieval_engine import build_context
 from app.semantic_engine import get_profile, update_profile_from_conversation
 from app.diary_engine import process_diary_entry, get_diary_summary
 from app.scheduler import schedule_user_reminder
-from app.prompts import SYSTEM_PROMPT_TEMPLATE, DIARY_ENTRY_INTRO
-from app.utils import get_llm, get_session_manager
+from app.prompts import SYSTEM_PROMPT_TEMPLATE, DIARY_ENTRY_INTRO, STAGE_DIRECTIVES
+from app.utils import get_llm, get_session_manager, check_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -204,10 +205,148 @@ async def handle_onboarding_message(update: Update, context: ContextTypes.DEFAUL
             "by the way, if you ever want to write down your thoughts, just use /diary. you can also view what i remember about you with /memory, check your entries with /entries, and look at previous chats with /chats."
         )
 
+def sanitize_for_prompt(text: str, max_len: int = 2000) -> str:
+    """Sanitize user messages to prevent prompt injection."""
+    text = text[:max_len]
+    injection_patterns = [
+        r'ignore (all |previous |above |prior )',
+        r'new (instruction|directive|rule|system|prompt)',
+        r'you are now',
+        r'forget everything',
+    ]
+    for pat in injection_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            logger.warning("Possible prompt injection detected and filtered")
+            text = re.sub(pat, '[FILTERED]', text, flags=re.IGNORECASE)
+    return text
+
+def _classify_message_type(text: str) -> tuple[str, int, str]:
+    """Classify the message and determine token limits/directives."""
+    text_clean = text.strip().lower()
+    word_count = len(text_clean.split())
+    
+    # 1. Task classification
+    task_keywords = {
+        "write", "create", "generate", "code", "program", "calculate", "math", "sum", 
+        "list", "plan", "trip", "explain", "how to", "tutorial", "recipe", "analyze", 
+        "summarize", "help me", "translate", "format"
+    }
+    # 2. Emotional classification
+    emotional_keywords = {
+        "sad", "depressed", "hurt", "cry", "pain", "angry", "hate", "mad", "happy", "excited", 
+        "glad", "joy", "scared", "fear", "anxious", "worry", "worried", "lonely", "alone", 
+        "love", "miss", "feel", "feeling", "broken", "worst", "awesome", "great", "bad", "good"
+    }
+    # 3. Reflective classification
+    reflective_keywords = {
+        "think", "thought", "ponder", "wonder", "reflect", "maybe", "perhaps", "realize", 
+        "realized", "understand", "believe", "mind", "life", "future", "past"
+    }
+    
+    if any(kw in text_clean for kw in task_keywords):
+        classification = "task"
+    elif "?" in text_clean or text_clean.startswith(("what", "why", "how", "who", "where", "when", "can you", "could you", "do you", "are you", "is there")):
+        classification = "question"
+    elif any(kw in text_clean for kw in emotional_keywords):
+        classification = "reflective" if word_count > 12 else "emotional"
+    elif any(kw in text_clean for kw in reflective_keywords) or word_count > 8:
+        classification = "reflective"
+    else:
+        classification = "casual"
+    
+    if classification == "casual":
+        max_tokens = 60
+        directive = "Directive: Respond in a short, casual texting format (1 sentence or a brief phrase, lowercase friendly). E.g. 'hii what are you doing?' or 'lmaoo true'."
+    elif classification == "emotional":
+        if word_count < 6:
+            max_tokens = 50
+            directive = "Directive: Keep it extremely short (1 sentence or a brief question). Just inquire naturally and supportively about what happened, without comfort paragraphs yet. E.g. 'what happened?' or 'oh no, what's wrong?'."
+        else:
+            max_tokens = 150
+            directive = "Directive: Keep it to 2-3 sentences. Show warm, casual, friend-like comfort without sounding like a therapist."
+    elif classification == "reflective":
+        if word_count < 8:
+            max_tokens = 100
+            directive = "Directive: Respond in 1-2 sentences. Keep it conversational and brief."
+        else:
+            max_tokens = 220
+            directive = "Directive: Respond in 2-4 sentences. Provide a thoughtful, peer-like reflection. Do not overexplain."
+    elif classification == "question":
+        max_tokens = 150
+        directive = "Directive: Answer directly in a friendly, conversational manner (1-3 sentences)."
+    else:  # task
+        max_tokens = 500
+        directive = "Directive: Respond as long as needed to fulfill the task helper request."
+        
+    return classification, max_tokens, directive
+
+async def _manage_session(user_id: int, user_info: dict, now_dt: datetime, last_seen_str: str | None, current_session_id: str | None, db) -> str:
+    """Check session expiration threshold and initialize new session if necessary."""
+    now_str = now_dt.isoformat()
+    start_new_session = False
+    if not current_session_id:
+        start_new_session = True
+    elif last_seen_str:
+        try:
+            last_seen_dt = datetime.fromisoformat(last_seen_str)
+            # 30-minute gap threshold
+            if (now_dt - last_seen_dt).total_seconds() >= 1800:
+                start_new_session = True
+        except Exception:
+            start_new_session = True
+    else:
+        start_new_session = True
+
+    if start_new_session:
+        # Initialize a completely new session
+        new_session_id = str(uuid.uuid4())
+        today_date = now_dt.strftime("%Y-%m-%d")
+        
+        writes = [
+            db.create_session(new_session_id, user_id, now_str, today_date),
+            db.update_user(user_id, current_session_id=new_session_id)
+        ]
+        if current_session_id:
+            end_time_str = last_seen_str or now_str
+            writes.append(db.update_session(user_id, current_session_id, end_time=end_time_str))
+            # Trigger out-of-band compaction in background task
+            asyncio.create_task(compact_session(user_id, current_session_id))
+            
+        await asyncio.gather(*writes)
+        return new_session_id
+        
+    return current_session_id
+
+async def _run_enrichment(user_id: int, text: str, response: str, episode_id: int, classification: str, current_session_id: str):
+    """Perform asynchronous database update for emotion, topics and user profile curation."""
+    db = get_db()
+    try:
+        # Cost Optimization: Skip emotion analysis for short casual messages
+        if classification == "casual" and len(text.split()) < 5:
+            await db.update_user(user_id, last_seen=datetime.now().isoformat())
+            return
+            
+        emo = await analyze_emotion(text, response)
+        if emo:
+            topics_json = json.dumps(emo.get("topics", []))
+            await db.execute("""
+                UPDATE episodes 
+                SET detected_emotion = ?, emotion_confidence = ?, secondary_emotion = ?, topics = ?
+                WHERE id = ? AND user_id = ?
+            """, emo.get("emotion"), emo.get("confidence"), emo.get("secondary_emotion"), topics_json, episode_id, user_id)
+        
+        await update_profile_from_conversation(user_id, text, response)
+        await db.update_user(user_id, last_seen=datetime.now().isoformat())
+    except Exception as e:
+        logger.error("Background enrichment failed for user %d: %s", user_id, e)
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
     db = get_db()
+    
+    # SEC-3 [HIGH]: Prompt Injection via User Messages
+    text = sanitize_for_prompt(text)
     
     async with get_session_manager().lock_user(user_id):
         user_info = await db.get_user(user_id)
@@ -235,46 +374,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"{res['followup']}\n\n{extra}")
             return
 
-        # --- Session Segmentation & Lifecycle ---
-        import uuid
-        from app.memory_engine import compact_session
-
         now_dt = datetime.now()
-        now_str = now_dt.isoformat()
         current_session_id = user_info.get("current_session_id")
         last_seen_str = user_info.get("last_seen")
 
-        start_new_session = False
-        if not current_session_id:
-            start_new_session = True
-        elif last_seen_str:
-            try:
-                last_seen_dt = datetime.fromisoformat(last_seen_str)
-                # 30-minute gap threshold
-                if (now_dt - last_seen_dt).total_seconds() >= 1800:
-                    start_new_session = True
-            except Exception:
-                start_new_session = True
-        else:
-            start_new_session = True
-
-        if start_new_session:
-            # Initialize a completely new session
-            new_session_id = str(uuid.uuid4())
-            today_date = now_dt.strftime("%Y-%m-%d")
-            
-            writes = [
-                db.create_session(new_session_id, user_id, now_str, today_date),
-                db.update_user(user_id, current_session_id=new_session_id)
-            ]
-            if current_session_id:
-                end_time_str = last_seen_str or now_str
-                writes.append(db.update_session(user_id, current_session_id, end_time=end_time_str))
-                # Trigger out-of-band compaction in background task
-                asyncio.create_task(compact_session(user_id, current_session_id))
-                
-            await asyncio.gather(*writes)
-            current_session_id = new_session_id
+        # Handle session lifecycle & segmentation
+        current_session_id = await _manage_session(user_id, user_info, now_dt, last_seen_str, current_session_id, db)
     
         await update.message.reply_chat_action(ChatAction.TYPING)
         
@@ -282,65 +387,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage = await determine_relationship_stage(user_id, user_info=user_info)
         
         # 2. Classify message type and compute token limit/instruction
-        from app.prompts import STAGE_DIRECTIVES
+        classification, max_tokens, directive = _classify_message_type(text)
         
-        # Fast Python-based heuristic classifier to avoid a sequential LLM call (saving ~1.5s - 3s latency)
-        text_clean = text.strip().lower()
-        word_count = len(text_clean.split())
-        
-        # 1. Task classification
-        task_keywords = {
-            "write", "create", "generate", "code", "program", "calculate", "math", "sum", 
-            "list", "plan", "trip", "explain", "how to", "tutorial", "recipe", "analyze", 
-            "summarize", "help me", "translate", "format"
-        }
-        # 2. Emotional classification
-        emotional_keywords = {
-            "sad", "depressed", "hurt", "cry", "pain", "angry", "hate", "mad", "happy", "excited", 
-            "glad", "joy", "scared", "fear", "anxious", "worry", "worried", "lonely", "alone", 
-            "love", "miss", "feel", "feeling", "broken", "worst", "awesome", "great", "bad", "good"
-        }
-        # 3. Reflective classification
-        reflective_keywords = {
-            "think", "thought", "ponder", "wonder", "reflect", "maybe", "perhaps", "realize", 
-            "realized", "understand", "believe", "mind", "life", "future", "past"
-        }
-        
-        if any(kw in text_clean for kw in task_keywords):
-            classification = "task"
-        elif "?" in text_clean or text_clean.startswith(("what", "why", "how", "who", "where", "when", "can you", "could you", "do you", "are you", "is there")):
-            classification = "question"
-        elif any(kw in text_clean for kw in emotional_keywords):
-            classification = "reflective" if word_count > 12 else "emotional"
-        elif any(kw in text_clean for kw in reflective_keywords) or word_count > 8:
-            classification = "reflective"
-        else:
-            classification = "casual"
-        
-        if classification == "casual":
-            max_tokens = 60
-            directive = "Directive: Respond in a short, casual texting format (1 sentence or a brief phrase, lowercase friendly). E.g. 'hii what are you doing?' or 'lmaoo true'."
-        elif classification == "emotional":
-            if word_count < 6:
-                max_tokens = 50
-                directive = "Directive: Keep it extremely short (1 sentence or a brief question). Just inquire naturally and supportively about what happened, without comfort paragraphs yet. E.g. 'what happened?' or 'oh no, what's wrong?'."
-            else:
-                max_tokens = 150
-                directive = "Directive: Keep it to 2-3 sentences. Show warm, casual, friend-like comfort without sounding like a therapist."
-        elif classification == "reflective":
-            if word_count < 8:
-                max_tokens = 100
-                directive = "Directive: Respond in 1-2 sentences. Keep it conversational and brief."
-            else:
-                max_tokens = 220
-                directive = "Directive: Respond in 2-4 sentences. Provide a thoughtful, peer-like reflection. Do not overexplain."
-        elif classification == "question":
-            max_tokens = 150
-            directive = "Directive: Answer directly in a friendly, conversational manner (1-3 sentences)."
-        else:  # task
-            max_tokens = 500
-            directive = "Directive: Respond as long as needed to fulfill the task helper request."
-    
         # 3. Fetch contexts
         ctx = await build_context(user_id, text, user_info=user_info, classification=classification)
         
@@ -348,6 +396,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not profile:
             profile = await get_profile(user_id)
         name = profile.get("name") or user_info.get("first_name") or update.effective_user.first_name or "friend"
+        
+        # Truncate context for casual messages to save tokens (Issue 17)
+        if classification == "casual" and ctx.get("full_profile_context"):
+            profile_lines = ctx["full_profile_context"].split("\n")
+            ctx["full_profile_context"] = "\n".join(profile_lines[:5])
         
         # Build dynamic system prompt
         stage_directive = STAGE_DIRECTIVES.get(stage, STAGE_DIRECTIVES["new"])
@@ -379,22 +432,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await update.message.reply_text(response)
             
-            async def enrich():
-                try:
-                    emo = await analyze_emotion(text, response)
-                    topics_json = json.dumps(emo.get("topics", []))
-                    await db.execute("""
-                        UPDATE episodes 
-                        SET detected_emotion = ?, emotion_confidence = ?, secondary_emotion = ?, topics = ?
-                        WHERE id = ? AND user_id = ?
-                    """, emo.get("emotion"), emo.get("confidence"), emo.get("secondary_emotion"), topics_json, episode_id, user_id)
-                    
-                    await update_profile_from_conversation(user_id, text, response)
-                    await db.update_user(user_id, last_seen=datetime.now().isoformat())
-                except Exception as e:
-                    logger.error("Background enrichment failed for user %d: %s", user_id, e)
-                        
-            asyncio.create_task(enrich())
+            # Trigger background enrichment
+            asyncio.create_task(_run_enrichment(user_id, text, response, episode_id, classification, current_session_id))
         except Exception as e:
             logger.error("Chat failed: %s", e)
             await update.message.reply_text("I'm a bit overwhelmed right now. Try again soon? 🤔")
@@ -666,7 +705,7 @@ async def clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-async def clear_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -681,24 +720,41 @@ async def clear_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             )
         elif query.data == "clear_cancel":
             await query.edit_message_text("❌ **Clear cancelled.** Your data is safe!")
+            
+        elif query.data == "reboot_confirm":
+            await db.delete_all_user_data(user_id)
+            await db.ensure_user(user_id, query.from_user.username, query.from_user.first_name)
+            await db.update_onboarding_data(user_id, onboarding_status="waiting_name")
+            await query.edit_message_text(
+                "🗑️ **System rebooted. All data has been wiped clean.**\n\n"
+                "Heyy, I don't think we've met before. What's your name? :)"
+            )
+        elif query.data == "reboot_cancel":
+            await query.edit_message_text("❌ **Reboot cancelled.** Your data is safe!")
 
 async def reboot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     async with get_session_manager().lock_user(user_id):
         db = get_db()
-        
-        # 1. Delete all user data
-        await db.delete_all_user_data(user_id)
-        
-        # 2. Reset onboarding state to 'waiting_name'
-        await db.ensure_user(user_id, update.effective_user.username, update.effective_user.first_name)
-        await db.update_onboarding_data(user_id, onboarding_status="waiting_name")
-        
-        # 3. Send prompt
-        await update.message.reply_text(
-            "🗑️ **system rebooted. all data has been wiped clean.**\n\n"
-            "heyy, i don't think we've met before. what's your name? :)"
-        )
+        user_info = await db.get_user(user_id)
+        if not user_info or user_info.get("onboarding_status", "not_started") != "completed":
+            await update.message.reply_text("hey, let's finish introducing ourselves first! what's your name?")
+            return
+            
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Yes, Reboot & Wipe Everything", callback_data="reboot_confirm"),
+            InlineKeyboardButton("↩️ Cancel", callback_data="reboot_cancel")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "⚠️ **Are you absolutely sure you want to reboot?**\n\n"
+        "This will permanently delete all your chats, diary entries, summaries, memories, and reset onboarding. "
+        "This action cannot be undone.",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
 
 async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telegram import BotCommand
@@ -712,6 +768,10 @@ async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BotCommand("clear", "clear all your data permanently"),
         BotCommand("reboot", "wipe everything and restart onboarding"),
         BotCommand("export", "export your companion history and memories"),
+        BotCommand("search", "search past conversations by keyword"),
+        BotCommand("stats", "view your usage statistics and streaks"),
+        BotCommand("mood", "show emotional trend breakdown"),
+        BotCommand("help", "list all available commands"),
         BotCommand("commands", "list all available commands")
     ]
     try:
@@ -730,9 +790,112 @@ async def commands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear - clear all your data permanently ⚠️\n"
         "/reboot - wipe everything and restart onboarding 🔄\n"
         "/export - export your companion history and memories 📦\n"
+        "/search - search past conversations by keyword 🔍\n"
+        "/stats - view your usage statistics and streaks 📊\n"
+        "/mood - show emotional trend breakdown 🎭\n"
+        "/help - list all available commands 📋\n"
         "/commands - list all available commands 📋",
         parse_mode="Markdown"
     )
+
+async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db = get_db()
+    
+    async with get_session_manager().lock_user(user_id):
+        user_info = await db.get_user(user_id)
+        if not user_info or user_info.get("onboarding_status", "not_started") != "completed":
+            await update.message.reply_text("hey, let's finish introducing ourselves first! what's your name?")
+            return
+            
+    if not context.args:
+        await update.message.reply_text("Usage: `/search <query>` (e.g. `/search python`)")
+        return
+        
+    query = " ".join(context.args)
+    episodes = await db.search_episodes(user_id, query, limit=5)
+    
+    if not episodes:
+        await update.message.reply_text(f"No matching conversations found for '{query}'.")
+        return
+        
+    lines = [f"🔍 **Search Results for '{query}'**\n"]
+    for ep in episodes:
+        date_str = ep["timestamp"][:10]
+        time_str = ep["timestamp"][11:16]
+        lines.append(f"📅 **{date_str} {time_str}**")
+        lines.append(f"👤 **You**: {ep['user_message']}")
+        lines.append(f"🤖 **Eva**: {ep['bot_response']}\n")
+        
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db = get_db()
+    
+    async with get_session_manager().lock_user(user_id):
+        user_info = await db.get_user(user_id)
+        if not user_info or user_info.get("onboarding_status", "not_started") != "completed":
+            await update.message.reply_text("hey, let's finish introducing ourselves first! what's your name?")
+            return
+            
+    # Run DB queries in parallel
+    tasks = [
+        db.get_episode_count(user_id),
+        db.get_diary_entry_count(user_id),
+        db.get_schedule(user_id),
+        db.get_active_memories(user_id)
+    ]
+    results = await asyncio.gather(*tasks)
+    
+    episode_count = results[0]
+    diary_count = results[1]
+    schedule = results[2] or {}
+    memories = results[3]
+    
+    streak = schedule.get("streak_count", 0)
+    longest_streak = schedule.get("longest_streak", 0)
+    memory_count = len(memories)
+    
+    lines = [
+        "📊 **Your Companion Stats**\n",
+        f"💬 **Chat Messages**: {episode_count}",
+        f"📓 **Diary Entries**: {diary_count}",
+        f"🔥 **Current Streak**: {streak} days",
+        f"🏆 **Longest Streak**: {longest_streak} days",
+        f"🧠 **Stored Memories**: {memory_count} items",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def mood_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db = get_db()
+    
+    async with get_session_manager().lock_user(user_id):
+        user_info = await db.get_user(user_id)
+        if not user_info or user_info.get("onboarding_status", "not_started") != "completed":
+            await update.message.reply_text("hey, let's finish introducing ourselves first! what's your name?")
+            return
+            
+    counts = await db.get_emotion_counts(user_id, days=30)
+    if not counts:
+        await update.message.reply_text("I don't have enough emotional data for you yet. Keep chatting and check back soon! 🎭")
+        return
+        
+    total = sum(e["count"] for e in counts)
+    
+    lines = ["🎭 **Your Mood Report (Last 30 days)**\n"]
+    for e in counts:
+        emotion = e["detected_emotion"]
+        count = e["count"]
+        pct = round(count / total * 100)
+        # Generate progress bar (10 blocks total)
+        blocks = round(pct / 10)
+        bar = "█" * blocks + "░" * (10 - blocks)
+        lines.append(f"`{emotion:<12}` {bar} {pct}% ({count})")
+        
+    lines.append(f"\nTotal analyzed messages: {total}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import os
@@ -818,6 +981,8 @@ def rate_limited(handler, is_ai: bool = False):
             logger.warning("Rate limit exceeded for user %d on api_request", user_id)
             if update.message:
                 await update.message.reply_text("⚠️ you are sending messages too fast. please wait a moment.")
+            elif update.callback_query:
+                await update.callback_query.answer("Too fast! Please wait.", show_alert=True)
             return
             
         if is_ai:
@@ -827,6 +992,8 @@ def rate_limited(handler, is_ai: bool = False):
                 logger.warning("Rate limit exceeded for user %d on AI generation", user_id)
                 if update.message:
                     await update.message.reply_text("⚠️ you are generating AI responses too fast. please wait a moment.")
+                elif update.callback_query:
+                    await update.callback_query.answer("Generating too fast! Please wait.", show_alert=True)
                 return
                 
         return await handler(update, context)
@@ -845,8 +1012,21 @@ def build_ptb_application() -> Application:
     app.add_handler(CommandHandler("clear", rate_limited(clear_handler)))
     app.add_handler(CommandHandler("reboot", rate_limited(reboot_handler)))
     app.add_handler(CommandHandler("commands", rate_limited(commands_handler)))
+    app.add_handler(CommandHandler("help", rate_limited(commands_handler)))
     app.add_handler(CommandHandler("export", rate_limited(export_handler)))
-    app.add_handler(CallbackQueryHandler(rate_limited(clear_callback_handler)))
+    app.add_handler(CommandHandler("search", rate_limited(search_handler)))
+    app.add_handler(CommandHandler("stats", rate_limited(stats_handler)))
+    app.add_handler(CommandHandler("mood", rate_limited(mood_handler)))
+    app.add_handler(CallbackQueryHandler(rate_limited(menu_callback_handler)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, rate_limited(message_handler, is_ai=True)))
     
     return app
+
+_ptb_app = None
+
+def get_ptb_app() -> Application:
+    """Get the application-level PTB singleton."""
+    global _ptb_app
+    if _ptb_app is None:
+        _ptb_app = build_ptb_application()
+    return _ptb_app

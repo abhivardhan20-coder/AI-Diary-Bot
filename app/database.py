@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS memory_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_items_user_cat ON memory_items(user_id, category, is_resolved);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_dedup ON memory_items(user_id, category, LOWER(content));
 """
 
 # ── PostgreSQL SQL Schema ───────────────────────────────────────────────────────
@@ -301,6 +302,7 @@ CREATE INDEX IF NOT EXISTS idx_summaries_user_type ON summaries(user_id, summary
 CREATE INDEX IF NOT EXISTS idx_diary_user_ts ON diary_entries(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_diary_user_importance ON diary_entries(user_id, importance_score DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_items_user_cat ON memory_items(user_id, category, is_resolved);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_dedup ON memory_items(user_id, category, LOWER(content));
 """
 
 class DatabaseManager:
@@ -342,6 +344,19 @@ class DatabaseManager:
                     except Exception as e:
                         logger.warning("Could not enable pgvector extension: %s", e)
                     await conn.execute(SCHEMA_SQL_PG)
+                    
+                    try:
+                        await conn.execute("""
+                            DELETE FROM memory_items 
+                            WHERE id NOT IN (
+                                SELECT MIN(id) 
+                                FROM memory_items 
+                                GROUP BY user_id, category, LOWER(content)
+                            );
+                        """)
+                    except Exception as e:
+                        logger.warning("Failed to deduplicate memory_items in PostgreSQL: %s", e)
+                        
                     await conn.execute(INDICES_SQL_PG)
                     try:
                         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS current_session_id TEXT;")
@@ -355,6 +370,21 @@ class DatabaseManager:
                 await self._db.execute("PRAGMA journal_mode=WAL")
                 await self._db.execute("PRAGMA synchronous=NORMAL")
                 await self._db.execute("PRAGMA foreign_keys=ON")
+                
+                try:
+                    await self._db.execute("""
+                        DELETE FROM memory_items 
+                        WHERE id NOT IN (
+                            SELECT MIN(id) 
+                            FROM memory_items 
+                            GROUP BY user_id, category, LOWER(content)
+                        );
+                    """)
+                    await self._db.commit()
+                except Exception as e:
+                    # Ignore if the table does not exist yet (will be created in executescript)
+                    pass
+                    
                 await self._db.executescript(SCHEMA_SQL)
                 try:
                     await self._db.execute("ALTER TABLE users ADD COLUMN current_session_id TEXT;")
@@ -729,6 +759,26 @@ class DatabaseManager:
                 INSERT INTO memory_items (user_id, category, content, first_seen, last_seen, mention_count, is_resolved, importance)
                 VALUES (?, ?, ?, ?, ?, 1, 0, ?)
             """, user_id, category, content, now, now, importance)
+        from app.utils import get_cache
+        await get_cache().delete(f"user:memories:{user_id}")
+        await get_cache().delete(f"user:profile:{user_id}")
+
+    async def decay_memory_items(self, user_id: int) -> None:
+        """Decay importance of memory items and resolve those below threshold (0.15)."""
+        await self.execute("""
+            UPDATE memory_items
+            SET importance = importance * CASE
+                WHEN category IN ('goals','relationships','important_events',
+                    'personality_traits','fears','aspirations','strengths')
+                THEN 0.98 ELSE 0.90 END,
+            is_resolved = CASE 
+                WHEN importance * CASE
+                    WHEN category IN ('goals','relationships','important_events',
+                        'personality_traits','fears','aspirations','strengths')
+                    THEN 0.98 ELSE 0.90 END < 0.15 
+                THEN 1 ELSE 0 END
+            WHERE user_id = ? AND is_resolved = 0
+        """, user_id)
         from app.utils import get_cache
         await get_cache().delete(f"user:memories:{user_id}")
         await get_cache().delete(f"user:profile:{user_id}")

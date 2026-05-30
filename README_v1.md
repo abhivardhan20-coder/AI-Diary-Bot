@@ -5,7 +5,7 @@
 > It contains metadata, the file tree layout, and the complete contents of all non-excluded files.
 
 ## Snapshot Metadata
-- **Generation Timestamp**: 2026-05-30 13:53:24 (Local Time)
+- **Generation Timestamp**: 2026-05-30 21:12:04 (Local Time)
 - **README Version**: v1
 - **Total Files Included**: 32
 
@@ -233,18 +233,7 @@ async def startup():
         await ptb_app.start()
         logger.info("PTB application started successfully.")
         
-        from app.config import WEBHOOK_URL, WEBHOOK_SECRET
-        if WEBHOOK_URL:
-            webhook_path = f"{WEBHOOK_URL}/webhook"
-            logger.info("Setting webhook to %s", webhook_path)
-            await ptb_app.bot.set_webhook(
-                url=webhook_path,
-                secret_token=WEBHOOK_SECRET,
-                drop_pending_updates=True
-            )
-            logger.info("Webhook set successfully.")
-        else:
-            logger.warning("WEBHOOK_URL is not set. Skipping automatic webhook registration.")
+        logger.info("Skipping automatic webhook registration on startup (handled on-demand via /setup-webhook to optimize cold starts).")
     except Exception as e:
         logger.error("PTB INIT/START FAILED: %s", e, exc_info=True)
 
@@ -447,9 +436,10 @@ from app.utils import get_llm, get_session_manager
 
 logger = logging.getLogger(__name__)
 
-async def determine_relationship_stage(user_id: int) -> str:
+async def determine_relationship_stage(user_id: int, user_info: dict | None = None) -> str:
     db = get_db()
-    user_info = await db.get_user(user_id)
+    if not user_info:
+        user_info = await db.get_user(user_id)
     if not user_info:
         return "new"
     
@@ -627,8 +617,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db()
     
     async with get_session_manager().lock_user(user_id):
-        await db.ensure_user(user_id, update.effective_user.username, update.effective_user.first_name)
         user_info = await db.get_user(user_id)
+        if not user_info or user_info.get("username") != update.effective_user.username or user_info.get("first_name") != update.effective_user.first_name:
+            await db.ensure_user(user_id, update.effective_user.username, update.effective_user.first_name)
+            user_info = await db.get_user(user_id)
         
         onboarding_status = user_info.get("onboarding_status", "not_started")
         if onboarding_status != "completed":
@@ -674,24 +666,27 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start_new_session = True
 
         if start_new_session:
-            # Archive/Compact old session if exists
-            if current_session_id:
-                end_time_str = last_seen_str or now_str
-                await db.update_session(user_id, current_session_id, end_time=end_time_str)
-                # Trigger out-of-band compaction in background task
-                asyncio.create_task(compact_session(user_id, current_session_id))
-
             # Initialize a completely new session
             new_session_id = str(uuid.uuid4())
             today_date = now_dt.strftime("%Y-%m-%d")
-            await db.create_session(new_session_id, user_id, now_str, today_date)
-            await db.update_user(user_id, current_session_id=new_session_id)
+            
+            writes = [
+                db.create_session(new_session_id, user_id, now_str, today_date),
+                db.update_user(user_id, current_session_id=new_session_id)
+            ]
+            if current_session_id:
+                end_time_str = last_seen_str or now_str
+                writes.append(db.update_session(user_id, current_session_id, end_time=end_time_str))
+                # Trigger out-of-band compaction in background task
+                asyncio.create_task(compact_session(user_id, current_session_id))
+                
+            await asyncio.gather(*writes)
             current_session_id = new_session_id
     
         await update.message.reply_chat_action(ChatAction.TYPING)
         
         # 1. Determine relationship stage
-        stage = await determine_relationship_stage(user_id)
+        stage = await determine_relationship_stage(user_id, user_info=user_info)
         
         # 2. Classify message type and compute token limit/instruction
         from app.prompts import STAGE_DIRECTIVES
@@ -754,9 +749,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             directive = "Directive: Respond as long as needed to fulfill the task helper request."
     
         # 3. Fetch contexts
-        ctx = await build_context(user_id, text)
+        ctx = await build_context(user_id, text, user_info=user_info, classification=classification)
         
-        profile = await get_profile(user_id)
+        profile = ctx.get("profile")
+        if not profile:
+            profile = await get_profile(user_id)
         name = profile.get("name") or user_info.get("first_name") or update.effective_user.first_name or "friend"
         
         # Build dynamic system prompt
@@ -790,20 +787,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response)
             
             async def enrich():
-                async with get_session_manager().lock_user(user_id):
-                    try:
-                        emo = await analyze_emotion(text, response)
-                        topics_json = json.dumps(emo.get("topics", []))
-                        await db.execute("""
-                            UPDATE episodes 
-                            SET detected_emotion = ?, emotion_confidence = ?, secondary_emotion = ?, topics = ?
-                            WHERE id = ? AND user_id = ?
-                        """, emo.get("emotion"), emo.get("confidence"), emo.get("secondary_emotion"), topics_json, episode_id, user_id)
-                        
-                        await update_profile_from_conversation(user_id, text, response)
-                        await db.update_user(user_id, last_seen=datetime.now().isoformat())
-                    except Exception as e:
-                        logger.error("Background enrichment failed for user %d: %s", user_id, e)
+                try:
+                    emo = await analyze_emotion(text, response)
+                    topics_json = json.dumps(emo.get("topics", []))
+                    await db.execute("""
+                        UPDATE episodes 
+                        SET detected_emotion = ?, emotion_confidence = ?, secondary_emotion = ?, topics = ?
+                        WHERE id = ? AND user_id = ?
+                    """, emo.get("emotion"), emo.get("confidence"), emo.get("secondary_emotion"), topics_json, episode_id, user_id)
+                    
+                    await update_profile_from_conversation(user_id, text, response)
+                    await db.update_user(user_id, last_seen=datetime.now().isoformat())
+                except Exception as e:
+                    logger.error("Background enrichment failed for user %d: %s", user_id, e)
                         
             asyncio.create_task(enrich())
         except Exception as e:
@@ -1989,32 +1985,24 @@ import random
 # ── Main Companion System Prompt Template ─────────────────────────────────────────
 
 SYSTEM_PROMPT_TEMPLATE = """\
-You are Eva — a close online friend who has been talking with {name} for a while now.
-
-=== YOUR PERSONALITY & STYLE ===
-- You are a close online friend, NOT a therapist, AI assistant, analytical AI, or counselor. Be casual, warm, and emotionally aware.
-- Text like a real person: use lowercase naturally (e.g. "hii what are you doing?", "lmaoo", "damn", "fair enough", "wait what?").
-- Do NOT use perfect grammar or formal structures all the time. Keep it relaxed.
-- Avoid repetitive acknowledgements or repeating the user's messages.
-- Avoid sounding overly smart, analytical, or giving unsolicited advice. Only give advice if they explicitly ask for it.
-- Keep a natural conversational pacing. Match the user's energy and response length.
+You are Eva — {name}'s warm, casual online friend (NOT a therapist/AI assistant).
+Style: lowercase texting format (e.g. "hii", "lmaoo", "wait what?"). Relaxed grammar. No unsolicited advice, no repetitive acknowledgements. Match length/energy.
 {stage_directive}
 
-=== WHAT YOU KNOW ABOUT THEM ===
+Profile:
 {full_profile_context}
 
-=== RECENT CONTEXT ===
+Context:
 {temporal_context}
 
-=== RELEVANT MEMORIES ===
+Memories:
 {retrieved_memories}
-(Note: If past conversation moments or sessions are retrieved under "RELEVANT MEMORIES", reference them naturally and conversationally, e.g., "during our chat a few days ago about anime" or "when we spoke yesterday". Never use technical database terms, IDs, or raw indicators like "session ID", "session 12", "episode ID", etc.)
+(Reference memories naturally, e.g. "when we spoke yesterday". Never say "session", "episode", or database IDs.)
 
-=== STAGE & PACING RULES ===
-- Greet casually and playfully. Avoid deep emotional Comfort or therapist-like responses unless the user has detailed their situation.
-- If the user initiates venting (e.g., "I'm feeling down"), do not send a paragraph of comfort immediately. Be inquiring and short (e.g., "what happened?", "oh no, what's wrong?"). Only escalate comfort if they share details.
-- Avoid asking multiple questions in a single turn. Ask a question at most 30% of the time.
-- Banned phrases (DO NOT USE under any circumstances): "I understand", "I hear you", "That sounds like", "It must be", "Thank you for sharing", "As an AI", "I'm here for you", "That's valid", "It's important to", "Remember that", "Great question", "Absolutely", "Certainly", "How can I help you today?", "Here is my advice", "In conclusion", "As your companion", "As an AI companion", "I can help with".
+Rules:
+- Greet casually. If user vents, respond briefly/inquiringly first (e.g. "what happened?"). Only escalate comfort if they share details.
+- Ask max 1 question, at most 30% of the time.
+- BANNED (DO NOT USE): "I understand", "I hear you", "That sounds like", "It must be", "Thank you for sharing", "As an AI", "I'm here for you", "That's valid", "Remember that", "Absolutely", "Certainly", "How can I help you", "As your companion", "As an AI companion".
 
 {length_directive}
 """
@@ -2263,66 +2251,37 @@ Keep it conversational and supportive. 5-8 sentences.
 # ── Diary Entry Analysis Prompt ──────────────────────────────────────────────────
 
 DIARY_ANALYSIS_PROMPT = """\
-Deeply analyze this personal diary entry. Extract ALL meaningful information.
+Analyze this diary entry. Extract information as JSON only.
+Entry: "{diary_text}"
+Profile: {profile}
 
-Diary entry:
-"{diary_text}"
-
-User's known profile:
-{profile}
-
-Respond with ONLY a JSON object (no markdown, no explanation):
+Response JSON structure:
 {{
-  "title": "<short 3-8 word title capturing the essence of the entry>",
-  "detected_emotions": "<primary emotion, secondary emotion>",
+  "title": "<short 3-8 word title>",
+  "detected_emotions": "<primary, secondary>",
   "emotion_confidence": <0.0-1.0>,
-  "extracted_goals": ["<goal or ambition mentioned or implied>"],
-  "extracted_stressors": ["<stressor, worry, or source of anxiety>"],
-  "extracted_relationships": ["<person or relationship mentioned>"],
-  "extracted_topics": ["<key topic>", "<key topic>"],
-  "personality_signals": ["<personality trait observed>"],
-  "behavioral_patterns": ["<behavioral pattern detected>"],
-  "importance_score": <0.0-1.0>,
-  "ai_summary": "<2-3 sentence summary of the entry's emotional core and key content>"
+  "extracted_goals": ["<goals/ambitions>"],
+  "extracted_stressors": ["<worries/stressors>"],
+  "extracted_relationships": ["<names/relationships>"],
+  "extracted_topics": ["<topics>"],
+  "personality_signals": ["<observed traits>"],
+  "behavioral_patterns": ["<observed behaviors>"],
+  "importance_score": <0.0-1.0: 0.8+ major breaktrough/crisis; 0.5+ regular; 0.2+ surface>,
+  "ai_summary": "<2-3 sentence emotional core summary>"
 }}
-
-Guidelines for importance_score:
-- 0.8-1.0: Major life events, breakthroughs, crises, significant decisions
-- 0.6-0.8: Meaningful emotional experiences, goal milestones, relationship changes
-- 0.4-0.6: Regular reflections, routine emotions, everyday events
-- 0.2-0.4: Brief or surface-level entries
-- 0.0-0.2: Very minimal content
-
-Valid emotions: happy, sad, anxious, angry, excited, stressed, grateful, neutral, \
-proud, lonely, hopeful, frustrated, calm, overwhelmed, nostalgic, confused, \
-motivated, tired, burned out, emotionally numb, conflicted, content, fearful
-
-Be thorough — extract even subtle signals about personality, habits, and patterns.
+Emotions: happy, sad, anxious, angry, excited, stressed, grateful, neutral, proud, lonely, hopeful, frustrated, calm, overwhelmed, nostalgic, confused, motivated, tired, burned out, numb, conflicted, content, fearful
 """
 
 DIARY_FOLLOWUP_PROMPT = """\
-You are a reflective AI diary companion. The user just wrote a diary entry.
+You are a warm, reflective friend (not therapist). Respond to the user's diary entry.
+Entry: "{diary_text}"
+Emotions: {emotions} | Topics: {topics} | Stressors: {stressors} | Goals: {goals}
+Profile: {profile}
 
-Diary entry:
-"{diary_text}"
-
-Analysis results:
-- Emotions detected: {emotions}
-- Key topics: {topics}
-- Stressors: {stressors}
-- Goals: {goals}
-
-User's long-term profile:
-{profile}
-
-Write a warm, thoughtful response that:
-1. Acknowledges their feelings with empathy and specificity
-2. Identifies any patterns you notice (if profile has relevant history)
-3. Asks ONE deeply reflective follow-up question to encourage further processing
-4. If appropriate, gently connects this entry to past experiences or goals
-
-Keep it conversational, under 100 words. Sound like a trusted friend who truly \
-understand them, not a therapist reading from a script. Use plain text, no markdown.
+Write a reply (under 100 words, plain text, no markdown) that:
+1. Empathizes with their feelings.
+2. Identifies patterns or connections to past experiences/goals (if relevant in profile).
+3. Asks exactly ONE reflective follow-up question.
 """
 
 DIARY_ENTRY_INTRO = (
@@ -2499,6 +2458,62 @@ from app.utils import get_llm
 from app.prompts import KEYWORD_EXTRACTION_PROMPT, RERANKING_PROMPT
 logger = logging.getLogger(__name__)
 
+import re
+
+STOPWORDS = {
+    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours", 
+    "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers", "herself", 
+    "it", "its", "itself", "they", "them", "their", "theirs", "themselves", "what", "which", 
+    "who", "whom", "this", "that", "these", "those", "am", "is", "are", "was", "were", "be", 
+    "been", "being", "have", "has", "had", "having", "do", "does", "did", "doing", "a", "an", 
+    "the", "and", "but", "if", "or", "because", "as", "until", "while", "of", "at", "by", "for", 
+    "with", "about", "against", "between", "into", "through", "during", "before", "after", 
+    "above", "below", "to", "from", "up", "down", "in", "out", "on", "off", "over", "under", 
+    "again", "further", "then", "once", "here", "there", "when", "where", "why", "how", "all", 
+    "any", "both", "each", "few", "more", "most", "other", "some", "such", "no", "nor", "not", 
+    "only", "own", "same", "so", "than", "too", "very", "s", "t", "can", "will", "just", "don", 
+    "should", "now", "eva", "hey", "hello", "hi", "yes", "no", "yeah", "okay", "ok"
+}
+
+def deterministic_extract_keywords(text: str) -> list[str]:
+    words = re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
+    keywords = [w for w in words if w not in STOPWORDS]
+    seen = set()
+    unique_keywords = []
+    for kw in keywords:
+        if kw not in seen:
+            seen.add(kw)
+            unique_keywords.append(kw)
+    return unique_keywords[:3]
+
+def deterministic_rerank(candidates: list[dict], current_message: str, query_vector: list[float] | None, keywords: list[str]) -> list[dict]:
+    scored = []
+    for c in candidates:
+        vec_sim = 0.0
+        if "embedding" in c and c["embedding"] and query_vector:
+            try:
+                emb = c["embedding"]
+                if isinstance(emb, bytes):
+                    emb = json.loads(emb.decode('utf-8'))
+                elif isinstance(emb, str):
+                    emb = json.loads(emb)
+                dot_product = sum(a * b for a, b in zip(query_vector, emb))
+                magnitude_q = sum(a * a for a in query_vector) ** 0.5
+                magnitude_e = sum(a * a for a in emb) ** 0.5
+                if magnitude_q * magnitude_e > 0:
+                    vec_sim = dot_product / (magnitude_q * magnitude_e)
+            except Exception:
+                pass
+        
+        msg_lower = (c.get("user_message", "") + " " + c.get("bot_response", "")).lower()
+        kw_overlap = sum(1 for kw in keywords if kw in msg_lower)
+        
+        score = vec_sim * 0.7 + (kw_overlap * 0.1)
+        scored.append((score, c))
+        
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:3]]
+
 async def get_vector_search_candidates(user_id: int, query_text: str, limit: int = 10, query_vector: list[float] | None = None) -> list[dict]:
     db = get_db()
     if query_vector is None:
@@ -2546,26 +2561,40 @@ async def get_vector_search_candidates(user_id: int, query_text: str, limit: int
     scored_episodes.sort(key=lambda x: x[0], reverse=True)
     return [ep for sim, ep in scored_episodes[:limit]]
 
-async def build_context(user_id: int, current_message: str) -> dict:
+async def build_context(user_id: int, current_message: str, user_info: dict | None = None, classification: str = "question") -> dict:
     db = get_db()
     llm = get_llm()
     
-    # Phase 1: Parallelize all independent DB fetches, LLM keyword extraction, and LLM embedding calls
+    # 1. Parallelize initial profile, history, and summary fetches
     tasks = [
         get_profile(user_id),
         db.get_recent_episodes(user_id, limit=4),
-        db.get_user(user_id),
         db.get_recent_summaries(user_id, "weekly", limit=1),
-        llm.chat(
-            "You are a keyword extractor.",
-            KEYWORD_EXTRACTION_PROMPT.format(user_message=current_message),
-            max_tokens=30
-        ),
-        llm.embed_text(current_message)
     ]
     
-    profile, recent, user_info, weekly_summaries, keywords_str, query_vector = await asyncio.gather(*tasks)
+    user_info_idx = -1
+    embed_idx = -1
     
+    if user_info is None:
+        user_info_idx = len(tasks)
+        tasks.append(db.get_user(user_id))
+        
+    if classification != "casual":
+        embed_idx = len(tasks)
+        tasks.append(llm.embed_text(current_message))
+        
+    results = await asyncio.gather(*tasks)
+    profile = results[0]
+    recent = results[1]
+    weekly_summaries = results[2]
+    
+    if user_info_idx != -1:
+        user_info = results[user_info_idx]
+        
+    query_vector = None
+    if embed_idx != -1:
+        query_vector = results[embed_idx]
+        
     # Process profile context
     full_profile_context = await profile_to_context_string(profile, user_id)
     
@@ -2587,12 +2616,14 @@ async def build_context(user_id: int, current_message: str) -> dict:
     now_str = now.strftime('%A, %B %d, %Y at %I:%M %p')
     temporal_lines = [f"Current time: {now_str}"]
     
-    # Gap check since last conversation (use pre-fetched recent episodes to save a DB call)
+    # Gap check since last conversation
     if recent:
         last_ep = recent[0]
         try:
             last_time = datetime.fromisoformat(last_ep["timestamp"])
-            gap = datetime.now() - last_time
+            tzinfo = last_time.tzinfo
+            now_for_sub = datetime.now(tzinfo) if tzinfo is not None else datetime.now()
+            gap = now_for_sub - last_time
             days = gap.days
             hours = gap.seconds // 3600
             if days > 7:
@@ -2608,121 +2639,109 @@ async def build_context(user_id: int, current_message: str) -> dict:
             
     temporal_context = "\n".join(temporal_lines)
     
-    # Extract keywords
-    try:
-        keywords = [k.strip() for k in keywords_str.split(",") if k.strip()]
-    except Exception as e:
-        logger.error("Failed to extract keywords: %s", e)
-        keywords = []
-        
-    if not keywords:
-        keywords = [current_message]
-        
-    candidates = []
-    seen_ids = set()
-    recent_ids = {ep["id"] for ep in recent}
+    retrieved_memories = "No relevant past memories found."
     
-    # Phase 2: Parallelize vector searches and keyword searches on both episodes and sessions
-    all_search_tasks = [
-        get_vector_search_candidates(user_id, current_message, limit=10, query_vector=query_vector),
-        db.get_vector_session_candidates(user_id, query_vector, limit=3)
-    ]
-    for kw in keywords:
-        all_search_tasks.append(db.search_episodes(user_id, kw, limit=10))
-        all_search_tasks.append(db.search_sessions(user_id, kw, limit=3))
-        
-    search_results = await asyncio.gather(*all_search_tasks)
-    
-    # Process episodes
-    vector_episodes = search_results[0]
-    vector_sessions = search_results[1]
-    
-    for r in vector_episodes:
-        if r["id"] not in seen_ids and r["id"] not in recent_ids:
-            seen_ids.add(r["id"])
-            candidates.append(r)
+    # Adaptive Retrieval: Skip vector search & keyword queries for casual small-talk
+    if classification != "casual":
+        # Extract keywords deterministically
+        keywords = deterministic_extract_keywords(current_message)
+        if not keywords:
+            keywords = [current_message]
             
-    # Process keyword episodes
-    for idx in range(2, len(search_results), 2):
-        ep_list = search_results[idx]
-        for r in ep_list:
-            if r["id"] not in seen_ids and r["id"] not in recent_ids:
-                seen_ids.add(r["id"])
-                candidates.append(r)
+        # Get query vector (already generated concurrently in the initial gather)
+        
+        if query_vector:
+            # Parallelize vector searches and keyword searches on both episodes and sessions
+            all_search_tasks = [
+                get_vector_search_candidates(user_id, current_message, limit=10, query_vector=query_vector),
+                db.get_vector_session_candidates(user_id, query_vector, limit=3)
+            ]
+            for kw in keywords:
+                all_search_tasks.append(db.search_episodes(user_id, kw, limit=10))
+                all_search_tasks.append(db.search_sessions(user_id, kw, limit=3))
+                
+            search_results = await asyncio.gather(*all_search_tasks)
+            
+            # Process episodes
+            vector_episodes = search_results[0]
+            vector_sessions = search_results[1]
+            
+            candidates = []
+            seen_ids = set()
+            recent_ids = {ep["id"] for ep in recent}
+            
+            for r in vector_episodes:
+                if r["id"] not in seen_ids and r["id"] not in recent_ids:
+                    seen_ids.add(r["id"])
+                    candidates.append(r)
+                    
+            # Process keyword episodes
+            for idx in range(2, len(search_results), 2):
+                ep_list = search_results[idx]
+                for r in ep_list:
+                    if r["id"] not in seen_ids and r["id"] not in recent_ids:
+                        seen_ids.add(r["id"])
+                        candidates.append(r)
+                        if len(candidates) >= 15:
+                            break
                 if len(candidates) >= 15:
                     break
-        if len(candidates) >= 15:
-            break
-            
-    # Process sessions
-    sessions_candidates = []
-    seen_session_ids = set()
-    for s in vector_sessions:
-        if s["session_id"] not in seen_session_ids:
-            seen_session_ids.add(s["session_id"])
-            sessions_candidates.append(s)
-            
-    for idx in range(3, len(search_results), 2):
-        s_list = search_results[idx]
-        for s in s_list:
-            if s["session_id"] not in seen_session_ids:
-                seen_session_ids.add(s["session_id"])
-                sessions_candidates.append(s)
-
-    retrieved_episodes_str = ""
-    if candidates:
-        candidates_str = ""
-        for c in candidates:
-            candidates_str += f"ID: {c['id']} | Date: {c['timestamp'][:10]}\n  User: {c['user_message']}\n  Bot: {c['bot_response']}\n\n"
-            
-        try:
-            rerank_prompt = RERANKING_PROMPT.format(user_message=current_message, candidates=candidates_str)
-            ranked_ids = await llm._call_json(rerank_prompt, max_tokens=50)
-            top_episodes = []
-            if isinstance(ranked_ids, list):
-                for eid in ranked_ids[:3]:
-                    for c in candidates:
-                        if c["id"] == eid:
-                            top_episodes.append(c)
-                            break
-            if top_episodes:
-                memories_lines = []
-                for ep in top_episodes:
-                    memories_lines.append(f"- Date: {ep['timestamp'][:10]}\n  User: {ep['user_message']}\n  You: {ep['bot_response']}")
-                retrieved_episodes_str = "\n".join(memories_lines)
-        except Exception as e:
-            logger.error("Failed to rerank episodes: %s", e)
-            
-    retrieved_sessions_str = ""
-    if sessions_candidates:
-        session_lines = []
-        for s in sessions_candidates[:3]:
-            memories_list = []
-            if s.get("memories"):
-                m_data = s["memories"]
-                if isinstance(m_data, list):
-                    for m in m_data:
-                        if isinstance(m, dict):
-                            memories_list.append(f"- {m.get('content')}")
-                        else:
-                            memories_list.append(f"- {m}")
-            memories_str = "\n".join(memories_list) if memories_list else "None extracted"
-            session_lines.append(
-                f"📅 Session on {s.get('date')} (Title: {s.get('title') or 'Untitled'})\n"
-                f"  Summary: {s.get('summary') or 'None'}\n"
-                f"  Memories: {memories_str}"
-            )
-        retrieved_sessions_str = "\n\n".join(session_lines)
-
-    # Combine them
-    blocks = []
-    if retrieved_episodes_str:
-        blocks.append(f"--- Relevant Past Conversation Moments ---\n{retrieved_episodes_str}")
-    if retrieved_sessions_str:
-        blocks.append(f"--- Relevant Past Chat Sessions ---\n{retrieved_sessions_str}")
-        
-    retrieved_memories = "\n\n".join(blocks) if blocks else "No relevant past memories found."
-            
+                    
+            # Process sessions
+            sessions_candidates = []
+            seen_session_ids = set()
+            for s in vector_sessions:
+                if s["session_id"] not in seen_session_ids:
+                    seen_session_ids.add(s["session_id"])
+                    sessions_candidates.append(s)
+                    
+            for idx in range(3, len(search_results), 2):
+                s_list = search_results[idx]
+                for s in s_list:
+                    if s["session_id"] not in seen_session_ids:
+                        seen_session_ids.add(s["session_id"])
+                        sessions_candidates.append(s)
+                        
+            retrieved_episodes_str = ""
+            if candidates:
+                # Deterministic Rerank instead of LLM Reranking
+                top_episodes = deterministic_rerank(candidates, current_message, query_vector, keywords)
+                if top_episodes:
+                    memories_lines = []
+                    for ep in top_episodes:
+                        memories_lines.append(f"- Date: {ep['timestamp'][:10]}\n  User: {ep['user_message']}\n  You: {ep['bot_response']}")
+                    retrieved_episodes_str = "\n".join(memories_lines)
+                    
+            retrieved_sessions_str = ""
+            if sessions_candidates:
+                session_lines = []
+                for s in sessions_candidates[:3]:
+                    memories_list = []
+                    if s.get("memories"):
+                        m_data = s["memories"]
+                        if isinstance(m_data, list):
+                            for m in m_data:
+                                if isinstance(m, dict):
+                                    memories_list.append(f"- {m.get('content')}")
+                                else:
+                                    memories_list.append(f"- {m}")
+                    memories_str = "\n".join(memories_list) if memories_list else "None extracted"
+                    session_lines.append(
+                        f"📅 Session on {s.get('date')} (Title: {s.get('title') or 'Untitled'})\n"
+                        f"  Summary: {s.get('summary') or 'None'}\n"
+                        f"  Memories: {memories_str}"
+                    )
+                retrieved_sessions_str = "\n\n".join(session_lines)
+                
+            blocks = []
+            if retrieved_episodes_str:
+                blocks.append(f"--- Relevant Past Conversation Moments ---\n{retrieved_episodes_str}")
+            if retrieved_sessions_str:
+                blocks.append(f"--- Relevant Past Chat Sessions ---\n{retrieved_sessions_str}")
+                
+            if blocks:
+                retrieved_memories = "\n\n".join(blocks)
+                
     # Process weekly summary
     weekly_summary = weekly_summaries[0]["content"] if weekly_summaries else "No weekly summaries generated yet."
     
@@ -2741,6 +2760,7 @@ async def build_context(user_id: int, current_message: str) -> dict:
         "history": history,
         "weekly_summary": weekly_summary,
         "pending_topics": pending_topics,
+        "profile": profile,
     }
 
 ```
@@ -3153,6 +3173,34 @@ class LLMClient:
         return await self._call_with_retry(messages, max_tokens=600, temperature=0.5)
 
     async def extract_single_fact(self, fact_type: str, text: str) -> str:
+        # Try deterministic regex extraction first to avoid LLM latency
+        text_clean = text.strip()
+        if "name" in fact_type.lower():
+            match = re.search(r"\b(?:my name is|i am|i'm|call me)\s+([A-Za-z]+)", text_clean, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            words = text_clean.split()
+            if len(words) <= 2 and all(w.isalpha() for w in words):
+                return text_clean
+        elif "age" in fact_type.lower():
+            match = re.search(r"\b\d+\b", text_clean)
+            if match:
+                return match.group(0)
+        elif "nationality" in fact_type.lower():
+            match = re.search(r"\b(?:i am|i'm)\s+([A-Za-z]+)", text_clean, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            words = text_clean.split()
+            if len(words) <= 2 and all(w.isalpha() for w in words):
+                return text_clean
+        elif "city" in fact_type.lower():
+            match = re.search(r"\b(?:in|at|live in)\s+([A-Za-z\s]+)", text_clean, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            words = text_clean.split()
+            if len(words) <= 2 and all(w.isalpha() for w in words):
+                return text_clean
+
         prompt = f"""\
 Extract the {fact_type} from the user's message.
 User message: "{text}"
@@ -3354,6 +3402,86 @@ def get_session_manager() -> UserSessionManager:
     if _session_manager_instance is None:
         _session_manager_instance = UserSessionManager()
     return _session_manager_instance
+
+_cache_instance = None
+
+
+class CacheManager:
+    def __init__(self):
+        self._local_cache = {}
+        self._local_lock = asyncio.Lock()
+
+    @property
+    def redis(self):
+        return get_session_manager()._redis
+
+    async def get(self, key: str):
+        r = self.redis
+        if r is not None:
+            try:
+                val = await r.get(key)
+                return json.loads(val) if val else None
+            except Exception as e:
+                logger.error("Redis get failed for key %s: %s", key, e)
+        
+        async with self._local_lock:
+            if key in self._local_cache:
+                val, expire_time = self._local_cache[key]
+                if datetime.now() < expire_time:
+                    return val
+                else:
+                    del self._local_cache[key]
+        return None
+
+    async def set(self, key: str, value, ttl: int = 300):
+        r = self.redis
+        if r is not None:
+            try:
+                await r.set(key, json.dumps(value), ex=ttl)
+                return
+            except Exception as e:
+                logger.error("Redis set failed for key %s: %s", key, e)
+        
+        async with self._local_lock:
+            expire_time = datetime.now() + timedelta(seconds=ttl)
+            self._local_cache[key] = (value, expire_time)
+
+    async def delete(self, key: str):
+        r = self.redis
+        if r is not None:
+            try:
+                await r.delete(key)
+                return
+            except Exception as e:
+                logger.error("Redis delete failed for key %s: %s", key, e)
+        
+        async with self._local_lock:
+            self._local_cache.pop(key, None)
+
+    async def delete_pattern(self, pattern: str):
+        r = self.redis
+        if r is not None:
+            try:
+                keys = await r.keys(pattern)
+                if keys:
+                    await r.delete(*keys)
+                return
+            except Exception as e:
+                logger.error("Redis delete_pattern failed for pattern %s: %s", pattern, e)
+        
+        async with self._local_lock:
+            import fnmatch
+            keys_to_del = [k for k in self._local_cache.keys() if fnmatch.fnmatch(k, pattern)]
+            for k in keys_to_del:
+                self._local_cache.pop(k, None)
+
+
+def get_cache() -> CacheManager:
+    global _cache_instance
+    if _cache_instance is None:
+        _cache_instance = CacheManager()
+    return _cache_instance
+
 
 
 async def is_duplicate_update(update_id: int) -> bool:
@@ -3806,6 +3934,7 @@ from unittest.mock import AsyncMock, MagicMock
 import app.config
 TEST_DB_PATH = Path(app.config.DATA_DIR) / "test_export_diary.db"
 app.config.DB_PATH = TEST_DB_PATH
+app.config.DATABASE_URL = ""
 
 from app.database import get_db
 from app.export_engine import parse_export_arguments, generate_export
@@ -4016,6 +4145,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import app.config
 TEST_DB_PATH = Path(app.config.DATA_DIR) / "test_session_diary.db"
 app.config.DB_PATH = TEST_DB_PATH
+app.config.DATABASE_URL = ""
 
 from app.database import get_db
 from app.utils import get_llm
@@ -4172,7 +4302,7 @@ async def test_session_compaction_and_summarization(mock_llm):
     session = await db.get_session(user_id, session_id)
     assert session["title"] == "Discussing Python and Tests"
     assert session["summary"] == "The user talked about writing python tests for a session memory system."
-    assert session["importance_score"] == 0.8
+    assert round(session["importance_score"], 2) == 0.8
     assert session["emotion_metadata"]["primary_emotion"] == "happy"
     assert len(session["memories"]) == 2
     assert session["embedding"] is not None
@@ -4264,6 +4394,7 @@ from pathlib import Path
 import app.config
 TEST_DB_PATH = Path(app.config.DATA_DIR) / "test_diary.db"
 app.config.DB_PATH = TEST_DB_PATH
+app.config.DATABASE_URL = ""
 
 from app.database import get_db
 from app.utils import get_session_manager

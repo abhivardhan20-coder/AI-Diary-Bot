@@ -23,7 +23,7 @@ def main():
         # In production, uvicorn app/webhook:app is usually run via Docker CMD
         # but having a python entrypoint is good for local dev and Railway.
         uvicorn.run(
-            "app.webhook:app",
+            "api.index:app",
             host="0.0.0.0",
             port=PORT,
             log_level="info",
