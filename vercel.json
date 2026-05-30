@@ -27,7 +27,7 @@
     },
     {
       "path": "/cron/reminder",
-      "schedule": "*/15 * * * *"
+      "schedule": "0 12 * * *"
     }
   ]
 }
