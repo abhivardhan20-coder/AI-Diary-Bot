@@ -126,15 +126,29 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
         db.get_recent_episodes(user_id, limit=4),
         db.get_recent_summaries(user_id, "weekly", limit=1),
     ]
+    
+    user_info_idx = -1
+    embed_idx = -1
+    
     if user_info is None:
+        user_info_idx = len(tasks)
         tasks.append(db.get_user(user_id))
+        
+    if classification != "casual":
+        embed_idx = len(tasks)
+        tasks.append(llm.embed_text(current_message))
         
     results = await asyncio.gather(*tasks)
     profile = results[0]
     recent = results[1]
     weekly_summaries = results[2]
-    if user_info is None:
-        user_info = results[3]
+    
+    if user_info_idx != -1:
+        user_info = results[user_info_idx]
+        
+    query_vector = None
+    if embed_idx != -1:
+        query_vector = results[embed_idx]
         
     # Process profile context
     full_profile_context = await profile_to_context_string(profile, user_id)
@@ -189,8 +203,7 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
         if not keywords:
             keywords = [current_message]
             
-        # Get query vector
-        query_vector = await llm.embed_text(current_message)
+        # Get query vector (already generated concurrently in the initial gather)
         
         if query_vector:
             # Parallelize vector searches and keyword searches on both episodes and sessions
@@ -302,4 +315,5 @@ async def build_context(user_id: int, current_message: str, user_info: dict | No
         "history": history,
         "weekly_summary": weekly_summary,
         "pending_topics": pending_topics,
+        "profile": profile,
     }

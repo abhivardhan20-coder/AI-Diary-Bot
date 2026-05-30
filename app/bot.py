@@ -210,8 +210,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db()
     
     async with get_session_manager().lock_user(user_id):
-        await db.ensure_user(user_id, update.effective_user.username, update.effective_user.first_name)
         user_info = await db.get_user(user_id)
+        if not user_info or user_info.get("username") != update.effective_user.username or user_info.get("first_name") != update.effective_user.first_name:
+            await db.ensure_user(user_id, update.effective_user.username, update.effective_user.first_name)
+            user_info = await db.get_user(user_id)
         
         onboarding_status = user_info.get("onboarding_status", "not_started")
         if onboarding_status != "completed":
@@ -257,18 +259,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start_new_session = True
 
         if start_new_session:
-            # Archive/Compact old session if exists
-            if current_session_id:
-                end_time_str = last_seen_str or now_str
-                await db.update_session(user_id, current_session_id, end_time=end_time_str)
-                # Trigger out-of-band compaction in background task
-                asyncio.create_task(compact_session(user_id, current_session_id))
-
             # Initialize a completely new session
             new_session_id = str(uuid.uuid4())
             today_date = now_dt.strftime("%Y-%m-%d")
-            await db.create_session(new_session_id, user_id, now_str, today_date)
-            await db.update_user(user_id, current_session_id=new_session_id)
+            
+            writes = [
+                db.create_session(new_session_id, user_id, now_str, today_date),
+                db.update_user(user_id, current_session_id=new_session_id)
+            ]
+            if current_session_id:
+                end_time_str = last_seen_str or now_str
+                writes.append(db.update_session(user_id, current_session_id, end_time=end_time_str))
+                # Trigger out-of-band compaction in background task
+                asyncio.create_task(compact_session(user_id, current_session_id))
+                
+            await asyncio.gather(*writes)
             current_session_id = new_session_id
     
         await update.message.reply_chat_action(ChatAction.TYPING)
@@ -339,7 +344,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 3. Fetch contexts
         ctx = await build_context(user_id, text, user_info=user_info, classification=classification)
         
-        profile = await get_profile(user_id)
+        profile = ctx.get("profile")
+        if not profile:
+            profile = await get_profile(user_id)
         name = profile.get("name") or user_info.get("first_name") or update.effective_user.first_name or "friend"
         
         # Build dynamic system prompt
