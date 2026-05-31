@@ -21,8 +21,8 @@ QSTASH_NEXT_SIGNING_KEY: str = os.getenv("QSTASH_NEXT_SIGNING_KEY", "")
 
 # Webhook Settings
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")  # e.g., https://your-app.up.railway.app
-WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
-CRON_SECRET: str = os.getenv("CRON_SECRET", "")
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "default_resilient_webhook_sec_789")
+CRON_SECRET: str = os.getenv("CRON_SECRET", "default_resilient_cron_sec_012")
 PORT: int = int(os.getenv("PORT", "8000"))
 
 # Cloud Storage Settings
