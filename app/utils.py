@@ -146,7 +146,7 @@ Do not include any other text, quotes, or markdown.
     async def embed_text(self, text: str) -> list[float] | None:
         import hashlib
         cache = get_cache()
-        key = "emb:" + hashlib.md5(text.encode('utf-8')).hexdigest()
+        key = "emb:" + hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]
         try:
             cached = await cache.get(key)
             if cached is not None:
@@ -496,6 +496,22 @@ async def check_rate_limit(user_id: int, action: str, limit: int, window: int) -
         local_key = f"local:{action}:{user_id}"
         return await _check_local_rate_limit(local_key, limit, window)
 
+
+async def _sweep_counters(interval: int = 300):
+    """
+    Background task to periodically clean up expired counters from _in_mem_counters.
+    Runs every interval seconds (default 5 minutes) to prevent unbounded memory growth.
+    """
+    import time
+    while True:
+        await asyncio.sleep(interval)
+        now = time.time()
+        async with _in_mem_lock:
+            expired_keys = [k for k, (_, exp) in _in_mem_counters.items() if now > exp]
+            for k in expired_keys:
+                _in_mem_counters.pop(k, None)
+            if expired_keys:
+                logger.debug("Swept %d expired counter keys", len(expired_keys))
 
 
 

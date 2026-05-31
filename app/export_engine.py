@@ -130,7 +130,8 @@ async def generate_export(user_id: int, options: dict) -> tuple[str, str]:
         # Verify session ownership & fetch
         session = await db.get_session(user_id, options["session_id"])
         if session:
-            episodes = await db.get_episodes_for_session(user_id, options["session_id"])
+            MAX_EXPORT_EPISODES = 5000
+            episodes = await db.get_episodes_for_session(user_id, options["session_id"], limit=MAX_EXPORT_EPISODES)
             messages = []
             for ep in episodes:
                 messages.append({

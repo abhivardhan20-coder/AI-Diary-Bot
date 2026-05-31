@@ -822,11 +822,19 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for ep in episodes:
         date_str = ep["timestamp"][:10]
         time_str = ep["timestamp"][11:16]
+        u_msg = ep['user_message'][:150] + ('...' if len(ep['user_message']) > 150 else '')
+        b_msg = ep['bot_response'][:150] + ('...' if len(ep['bot_response']) > 150 else '')
         lines.append(f"📅 **{date_str} {time_str}**")
-        lines.append(f"👤 **You**: {escape_markdown(ep['user_message'])}")
-        lines.append(f"🤖 **Eva**: {escape_markdown(ep['bot_response'])}\n")
-        
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"👤 **You**: {escape_markdown(u_msg)}")
+        lines.append(f"🤖 **Eva**: {escape_markdown(b_msg)}\n")
+    
+    # Chunk output to prevent exceeding Telegram's 4096 char limit
+    full_text = "\n".join(lines)
+    if len(full_text) > 4000:
+        for i in range(0, len(full_text), 4000):
+            await update.message.reply_text(full_text[i:i+4000], parse_mode="Markdown")
+    else:
+        await update.message.reply_text(full_text, parse_mode="Markdown")
 
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id

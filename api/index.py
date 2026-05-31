@@ -93,6 +93,11 @@ async def lifespan(app: FastAPI):
                 await ptb_app.updater.start_polling()
         else:
             logger.info("Skipping automatic webhook registration on startup (handled on-demand via /setup-webhook to optimize Vercel cold starts).")
+        
+        # Start background sweeper task for _in_mem_counters
+        from app.utils import _sweep_counters
+        asyncio.create_task(_sweep_counters(interval=300))
+        logger.info("Started background counter sweep task (interval: 300s).")
     except Exception as e:
         logger.error("PTB INIT/START FAILED: %s", e, exc_info=True)
 
@@ -242,6 +247,7 @@ async def cron_daily(request: Request):
         from app.config import QSTASH_TOKEN, WEBHOOK_URL
         if QSTASH_TOKEN and WEBHOOK_URL:
             logger.info("Enqueuing daily cron jobs to QStash for %d users", len(user_ids))
+            failed = []
             async with httpx.AsyncClient() as client:
                 for uid in user_ids:
                     try:
@@ -258,6 +264,12 @@ async def cron_daily(request: Request):
                         res.raise_for_status()
                     except Exception as eq:
                         logger.error("Failed to enqueue daily cron for user %d: %s", uid, eq)
+                        failed.append(uid)
+            
+            if failed:
+                logger.error("QStash enqueue failed for %d/%d users", len(failed), len(user_ids))
+                return {"status": "partial", "failed_count": len(failed), "total": len(user_ids)}
+            return {"status": "success", "total": len(user_ids)}
         else:
             logger.warning("QStash not configured. Falling back to sequential execution for %d users", len(user_ids))
             for uid in user_ids:
@@ -275,6 +287,7 @@ async def cron_daily(request: Request):
 @app.post("/cron/user-daily")
 async def cron_user_daily(request: Request):
     client_host = request.client.host if request.client else "unknown"
+    user_id = None  # Initialize for exception handler
     if CRON_SECRET:
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {CRON_SECRET}"
@@ -284,9 +297,13 @@ async def cron_user_daily(request: Request):
             
     try:
         data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"detail": "Invalid JSON"})
+    
+    try:
         user_id = data.get("user_id")
-        if not user_id:
-            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"detail": "Missing user_id"})
+        if not isinstance(user_id, int):
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"detail": "user_id must be an integer"})
             
         logger.info("Executing daily summaries and curation for user %d", user_id)
         await check_and_generate_summaries(user_id)
