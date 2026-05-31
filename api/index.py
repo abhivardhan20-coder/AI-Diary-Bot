@@ -142,6 +142,14 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_ico():
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@app.get("/favicon.png", include_in_schema=False)
+async def favicon_png():
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 @app.get("/setup-webhook")
 async def setup_webhook(request: Request):
     # SEC-2 [CRITICAL]: setup-webhook Endpoint Has No Authentication
