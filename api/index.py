@@ -3,6 +3,7 @@ import json
 import logging
 import hmac
 import httpx
+import asyncio
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 from telegram import Update
