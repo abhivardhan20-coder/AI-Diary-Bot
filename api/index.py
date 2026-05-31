@@ -35,7 +35,9 @@ async def lifespan(app: FastAPI):
         validate_config()
     except Exception as e:
         logger.critical("Configuration validation failed: %s", e)
-        raise e
+        from app.config import IS_VERCEL
+        if not IS_VERCEL:
+            raise e
 
     try:
         logger.info("Starting database initialization...")

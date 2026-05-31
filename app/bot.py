@@ -1011,7 +1011,11 @@ def rate_limited(handler, is_ai: bool = False):
 
 def build_ptb_application() -> Application:
     """Factory to build the PTB application."""
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    token = TELEGRAM_BOT_TOKEN
+    if not token or ":" not in token:
+        logger.warning("TELEGRAM_BOT_TOKEN is empty or invalid. Using placeholder to prevent startup crash.")
+        token = "1234567890:PlaceholderTokenForStartupResilienceOnly"
+    app = ApplicationBuilder().token(token).build()
     
     app.add_handler(CommandHandler("start", rate_limited(start_handler)))
     app.add_handler(CommandHandler("diary", rate_limited(diary_handler)))
